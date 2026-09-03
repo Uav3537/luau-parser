@@ -420,12 +420,72 @@ interface PrintOptions {
  */
 declare function print(node: Node, options?: PrintOptions): string;
 
+type BindingId = number;
+type BindingKind = "local" | "param" | "self" | "for-numeric" | "for-generic" | "global";
+/** A node that can serve as a binding's "declared here" site. */
+type DeclarationNode = Identifier | TypedIdentifier | FunctionParameter;
+interface Binding {
+    readonly id: BindingId;
+    /** Name at the point this binding was created. Rename passes update
+     *  this and every node in `references` (+ `declarationNode`) together —
+     *  this field is just what analysis saw, not a source of truth after a
+     *  rename pass has run. */
+    name: string;
+    readonly kind: BindingKind;
+    /** Absent for a `global` binding that was never assigned to in this
+     *  file (e.g. only ever read, or a pre-registered builtin). */
+    declarationNode?: DeclarationNode;
+    /** Every Identifier *usage* resolved to this binding (does not include
+     *  `declarationNode` itself). */
+    readonly references: Identifier[];
+    /** True for globals pre-registered via `analyzeScopes`'s
+     *  `builtinGlobals` option (e.g. `game`, `script`, `print`). Such
+     *  bindings are never given a `declarationNode` from assignment
+     *  inference, since they're not really "defined" in this file. */
+    isBuiltin?: boolean;
+}
+interface ScopeAnalysis {
+    /** Every Identifier that appears in a variable *usage* position (i.e.
+     *  every node also reachable through some `Binding.references`, plus
+     *  `FunctionDeclarationStatement.target.base`), mapped to its binding.
+     *  Property names, method names, table field names, and type-position
+     *  identifiers are never entered here — they aren't variable refs. */
+    readonly bindingOf: Map<Identifier, BindingId>;
+    readonly bindings: Map<BindingId, Binding>;
+    /** Convenience: every global binding's id, keyed by name. Global
+     *  bindings have no lexical scope, so this is the closest thing to
+     *  "the" scope for them — and later a multi-file language server can
+     *  swap this map out for a project-wide registry without changing
+     *  anything else about this shape. */
+    readonly globalsByName: Map<string, BindingId>;
+}
+interface AnalyzeScopesOptions {
+    /** Names to pre-register as global bindings with `isBuiltin: true`
+     *  before the walk starts (e.g. Roblox/Luau standard globals:
+     *  `game`, `script`, `workspace`, `print`, `pairs`, ...). Referencing
+     *  one of these does not count as "defining" it, so `declarationNode`
+     *  is left unset even though the binding exists up front. */
+    builtinGlobals?: readonly string[];
+}
+declare function getBinding(analysis: ScopeAnalysis, id: Identifier): Binding | undefined;
+declare function isGlobal(binding: Binding): boolean;
+/** True if a global binding was never assigned to anywhere in this file
+ *  (and isn't a pre-registered builtin) — i.e. it's read-only and
+ *  undeclared, which is almost always a typo rather than an intentional
+ *  implicit global. Handy for a "possibly undefined global" diagnostic. */
+declare function isUnassignedGlobal(binding: Binding): boolean;
+declare function analyzeScopes(program: Program, options?: AnalyzeScopesOptions): ScopeAnalysis;
+
 declare const luauparser: {
     readonly tokenize: typeof tokenize;
     readonly parseTokens: typeof parseTokens;
     readonly parse: typeof parse;
     readonly parseExpressionFromSource: typeof parseExpressionFromSource;
     readonly print: typeof print;
+    readonly analyzeScopes: typeof analyzeScopes;
+    readonly getBinding: typeof getBinding;
+    readonly isGlobal: typeof isGlobal;
+    readonly isUnassignedGlobal: typeof isUnassignedGlobal;
 };
 
-export { type AssignmentStatement, type BaseNode, type BaseToken, type BinaryExpression, BinaryOperators, type Block, type BooleanLiteral, type BreakStatement, type CallExpression, type CallStatement, type CompoundAssignmentStatement, type ContinueStatement, type DoStatement, type EOFToken, type ExportTypeAliasStatement, type Expression, type FunctionBody, type FunctionDeclarationStatement, type FunctionExpression, type FunctionName, type FunctionParameter, type FunctionTypeNode, type FunctionTypeParameter, type GenericForStatement, type GenericTypeParameter, type Identifier, type IdentifierToken, type IfClause, type IfElseExpression, type IfStatement, type IndexExpression, type InterpolatedStringExpression, type InterpolatedStringPart, type InterpolatedStringPart_Expression, type InterpolatedStringPart_String, type InterpolatedStringToken, type IntersectionTypeNode, type KeywordToken, Keywords, LexError, type LiteralToken, type LocalFunctionStatement, type LocalStatement, type MemberExpression, type MethodCallExpression, type NilLiteral, type Node, type NumberLiteral, type NumericForStatement, type OperatorToken, Operators, type OptionalTypeNode, type ParenthesizedExpression, type ParenthesizedTypeNode, ParseError, type PrintOptions, type Program, type PunctuatorToken, Punctuators, type RepeatStatement, type ReturnStatement, type Statement, type StringLiteral, type TableExpression, type TableField, type TableTypeNode, type TableTypeProperty, type Token, type TypeAliasStatement, type TypeAssertionExpression, type TypeLiteralBoolean, type TypeLiteralString, type TypeNode, type TypePackNode, type TypeReference, type TypedIdentifier, type TypeofTypeNode, type UnaryExpression, UnaryOperators, type UnionTypeNode, type VarargExpression, type VariadicTypeNode, type WhileStatement, luauparser as default, luauparser, parse, parseExpressionFromSource, parseTokens, print, tokenize };
+export { type AssignmentStatement, type BaseNode, type BaseToken, type BinaryExpression, BinaryOperators, type Binding, type BindingId, type BindingKind, type Block, type BooleanLiteral, type BreakStatement, type CallExpression, type CallStatement, type CompoundAssignmentStatement, type ContinueStatement, type DoStatement, type EOFToken, type ExportTypeAliasStatement, type Expression, type FunctionBody, type FunctionDeclarationStatement, type FunctionExpression, type FunctionName, type FunctionParameter, type FunctionTypeNode, type FunctionTypeParameter, type GenericForStatement, type GenericTypeParameter, type Identifier, type IdentifierToken, type IfClause, type IfElseExpression, type IfStatement, type IndexExpression, type InterpolatedStringExpression, type InterpolatedStringPart, type InterpolatedStringPart_Expression, type InterpolatedStringPart_String, type InterpolatedStringToken, type IntersectionTypeNode, type KeywordToken, Keywords, LexError, type LiteralToken, type LocalFunctionStatement, type LocalStatement, type MemberExpression, type MethodCallExpression, type NilLiteral, type Node, type NumberLiteral, type NumericForStatement, type OperatorToken, Operators, type OptionalTypeNode, type ParenthesizedExpression, type ParenthesizedTypeNode, ParseError, type PrintOptions, type Program, type PunctuatorToken, Punctuators, type RepeatStatement, type ReturnStatement, type ScopeAnalysis, type Statement, type StringLiteral, type TableExpression, type TableField, type TableTypeNode, type TableTypeProperty, type Token, type TypeAliasStatement, type TypeAssertionExpression, type TypeLiteralBoolean, type TypeLiteralString, type TypeNode, type TypePackNode, type TypeReference, type TypedIdentifier, type TypeofTypeNode, type UnaryExpression, UnaryOperators, type UnionTypeNode, type VarargExpression, type VariadicTypeNode, type WhileStatement, analyzeScopes, luauparser as default, getBinding, isGlobal, isUnassignedGlobal, luauparser, parse, parseExpressionFromSource, parseTokens, print, tokenize };

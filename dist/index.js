@@ -2261,13 +2261,281 @@ var BinaryOperators = [
 ];
 var UnaryOperators = ["-", "not", "#"];
 
+// src/ast/analyzeScopes.ts
+function getBinding(analysis, id) {
+  const bindingId = analysis.bindingOf.get(id);
+  return bindingId === void 0 ? void 0 : analysis.bindings.get(bindingId);
+}
+function isGlobal(binding) {
+  return binding.kind === "global";
+}
+function isUnassignedGlobal(binding) {
+  return binding.kind === "global" && !binding.isBuiltin && binding.declarationNode === void 0;
+}
+function childScope(parent) {
+  return { parent, declarations: /* @__PURE__ */ new Map() };
+}
+var Analyzer = class {
+  nextId = 0;
+  bindingOf = /* @__PURE__ */ new Map();
+  bindings = /* @__PURE__ */ new Map();
+  globalScope = { parent: null, declarations: /* @__PURE__ */ new Map() };
+  constructor(options) {
+    for (const name of options.builtinGlobals ?? []) {
+      const id = this.getOrCreateGlobalBinding(name);
+      this.bindings.get(id).isBuiltin = true;
+    }
+  }
+  run(program) {
+    this.visitBlock(program.body, childScope(this.globalScope));
+    return {
+      bindingOf: this.bindingOf,
+      bindings: this.bindings,
+      globalsByName: this.globalScope.declarations
+    };
+  }
+  // ---------------- declaration / resolution primitives ----------------
+  declare(scope, name, kind, node) {
+    const id = this.nextId++;
+    this.bindings.set(id, { id, name, kind, declarationNode: node, references: [] });
+    scope.declarations.set(name, id);
+    return id;
+  }
+  resolve(scope, name) {
+    for (let s = scope; s; s = s.parent) {
+      const id = s.declarations.get(name);
+      if (id !== void 0) return id;
+    }
+    return this.getOrCreateGlobalBinding(name);
+  }
+  getOrCreateGlobalBinding(name) {
+    const existing = this.globalScope.declarations.get(name);
+    if (existing !== void 0) return existing;
+    const id = this.nextId++;
+    this.bindings.set(id, { id, name, kind: "global", references: [] });
+    this.globalScope.declarations.set(name, id);
+    return id;
+  }
+  /** Record a variable-usage Identifier as resolved to `scope`'s view of
+   *  its name. */
+  reference(scope, identifier) {
+    const id = this.resolve(scope, identifier.name);
+    this.bindingOf.set(identifier, id);
+    this.bindings.get(id).references.push(identifier);
+  }
+  /** For assignment-like targets (`x = ...`, `function foo() end`): if
+   *  this resolved to a global with no declaration site yet, treat this
+   *  as its "definition" for go-to-definition purposes. Locals and
+   *  builtins are left alone. */
+  recordPossibleGlobalDefinition(id, node) {
+    const binding = this.bindings.get(id);
+    if (binding.kind === "global" && !binding.isBuiltin && binding.declarationNode === void 0) {
+      binding.declarationNode = node;
+    }
+  }
+  referenceAsAssignmentTarget(scope, identifier) {
+    const id = this.resolve(scope, identifier.name);
+    this.bindingOf.set(identifier, id);
+    this.bindings.get(id).references.push(identifier);
+    this.recordPossibleGlobalDefinition(id, identifier);
+  }
+  // ---------------- blocks / statements ----------------
+  visitBlock(block, scope) {
+    for (const stmt of block.statements) this.visitStatement(stmt, scope);
+  }
+  /** Visits a block in a *fresh child scope* of `scope` — the common case
+   *  for loop/if/do bodies, where the block's own locals shouldn't leak
+   *  into the surrounding scope. */
+  visitBlockInNewScope(block, scope) {
+    this.visitBlock(block, childScope(scope));
+  }
+  visitStatement(stmt, scope) {
+    switch (stmt.type) {
+      case "LocalStatement": {
+        for (const init of stmt.init) this.visitExpression(init, scope);
+        for (const name of stmt.names) this.declare(scope, name.name, "local", name);
+        return;
+      }
+      case "LocalFunctionStatement": {
+        this.declare(scope, stmt.name.name, "local", stmt.name);
+        this.visitFunctionBody(stmt.func, scope);
+        return;
+      }
+      case "FunctionDeclarationStatement": {
+        this.referenceAsAssignmentTarget(scope, stmt.target.base);
+        this.visitFunctionBody(stmt.func, scope, stmt.isMethod);
+        return;
+      }
+      case "AssignmentStatement": {
+        for (const value of stmt.values) this.visitExpression(value, scope);
+        for (const target of stmt.targets) {
+          if (target.type === "Identifier") {
+            this.referenceAsAssignmentTarget(scope, target);
+          } else {
+            this.visitExpression(target, scope);
+          }
+        }
+        return;
+      }
+      case "CompoundAssignmentStatement": {
+        this.visitExpression(stmt.value, scope);
+        if (stmt.target.type === "Identifier") {
+          this.reference(scope, stmt.target);
+        } else {
+          this.visitExpression(stmt.target, scope);
+        }
+        return;
+      }
+      case "CallStatement":
+        this.visitExpression(stmt.expression, scope);
+        return;
+      case "DoStatement":
+        this.visitBlockInNewScope(stmt.body, scope);
+        return;
+      case "WhileStatement":
+        this.visitExpression(stmt.condition, scope);
+        this.visitBlockInNewScope(stmt.body, scope);
+        return;
+      case "RepeatStatement": {
+        const bodyScope = childScope(scope);
+        this.visitBlock(stmt.body, bodyScope);
+        this.visitExpression(stmt.condition, bodyScope);
+        return;
+      }
+      case "IfStatement": {
+        for (const clause of stmt.clauses) {
+          this.visitExpression(clause.condition, scope);
+          this.visitBlockInNewScope(clause.body, scope);
+        }
+        if (stmt.alternate) this.visitBlockInNewScope(stmt.alternate, scope);
+        return;
+      }
+      case "NumericForStatement": {
+        this.visitExpression(stmt.start, scope);
+        this.visitExpression(stmt.end, scope);
+        if (stmt.step) this.visitExpression(stmt.step, scope);
+        const bodyScope = childScope(scope);
+        this.declare(bodyScope, stmt.variable.name, "for-numeric", stmt.variable);
+        this.visitBlock(stmt.body, bodyScope);
+        return;
+      }
+      case "GenericForStatement": {
+        for (const it of stmt.iterators) this.visitExpression(it, scope);
+        const bodyScope = childScope(scope);
+        for (const v of stmt.variables) this.declare(bodyScope, v.name, "for-generic", v);
+        this.visitBlock(stmt.body, bodyScope);
+        return;
+      }
+      case "ReturnStatement":
+        for (const arg of stmt.arguments) this.visitExpression(arg, scope);
+        return;
+      case "BreakStatement":
+      case "ContinueStatement":
+        return;
+      case "TypeAliasStatement":
+      case "ExportTypeAliasStatement":
+        return;
+    }
+  }
+  // ---------------- functions ----------------
+  visitFunctionBody(func, outerScope, isMethod = false) {
+    const fnScope = childScope(outerScope);
+    func.params.forEach((param, i) => {
+      const kind = isMethod && i === 0 ? "self" : "param";
+      this.declare(fnScope, param.name, kind, param);
+    });
+    this.visitBlock(func.body, fnScope);
+  }
+  // ---------------- expressions ----------------
+  visitExpression(expr, scope) {
+    switch (expr.type) {
+      case "Identifier":
+        this.reference(scope, expr);
+        return;
+      case "NilLiteral":
+      case "BooleanLiteral":
+      case "NumberLiteral":
+      case "StringLiteral":
+      case "VarargExpression":
+        return;
+      case "InterpolatedStringExpression":
+        for (const part of expr.parts) {
+          if (part.kind === "expression") this.visitExpression(part.expression, scope);
+        }
+        return;
+      case "FunctionExpression":
+        this.visitFunctionBody(expr.func, scope);
+        return;
+      case "TableExpression":
+        for (const field of expr.fields) this.visitTableField(field, scope);
+        return;
+      case "BinaryExpression":
+        this.visitExpression(expr.left, scope);
+        this.visitExpression(expr.right, scope);
+        return;
+      case "UnaryExpression":
+        this.visitExpression(expr.argument, scope);
+        return;
+      case "MemberExpression":
+        this.visitExpression(expr.object, scope);
+        return;
+      case "IndexExpression":
+        this.visitExpression(expr.object, scope);
+        this.visitExpression(expr.index, scope);
+        return;
+      case "CallExpression":
+        this.visitExpression(expr.callee, scope);
+        for (const arg of expr.arguments) this.visitExpression(arg, scope);
+        return;
+      case "MethodCallExpression":
+        this.visitExpression(expr.object, scope);
+        for (const arg of expr.arguments) this.visitExpression(arg, scope);
+        return;
+      case "ParenthesizedExpression":
+        this.visitExpression(expr.expression, scope);
+        return;
+      case "TypeAssertionExpression":
+        this.visitExpression(expr.expression, scope);
+        return;
+      case "IfElseExpression":
+        for (const clause of expr.clauses) {
+          this.visitExpression(clause.condition, scope);
+          this.visitExpression(clause.body, scope);
+        }
+        this.visitExpression(expr.alternate, scope);
+        return;
+    }
+  }
+  visitTableField(field, scope) {
+    switch (field.type) {
+      case "TableFieldPositional":
+        this.visitExpression(field.value, scope);
+        return;
+      case "TableFieldNamed":
+        this.visitExpression(field.value, scope);
+        return;
+      case "TableFieldComputed":
+        this.visitExpression(field.key, scope);
+        this.visitExpression(field.value, scope);
+        return;
+    }
+  }
+};
+function analyzeScopes(program, options = {}) {
+  return new Analyzer(options).run(program);
+}
+
 // src/index.ts
 var luauparser = {
   tokenize,
   parseTokens,
   parse,
   parseExpressionFromSource,
-  print
+  print,
+  analyzeScopes,
+  getBinding,
+  isGlobal,
+  isUnassignedGlobal
 };
 var index_default = luauparser;
 export {
@@ -2278,7 +2546,11 @@ export {
   ParseError,
   Punctuators,
   UnaryOperators,
+  analyzeScopes,
   index_default as default,
+  getBinding,
+  isGlobal,
+  isUnassignedGlobal,
   luauparser,
   parse,
   parseExpressionFromSource,

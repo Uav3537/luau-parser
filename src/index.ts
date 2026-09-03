@@ -6,10 +6,17 @@ import { print } from '@ast/printer'
 export * from '@lexer/token'
 export * from '@ast/nodes'
 export type { PrintOptions } from '@ast/printer'
+import { analyzeScopes, getBinding, isGlobal, isUnassignedGlobal } from '@ast/analyzeScopes'
+export type { ScopeAnalysis, Binding, BindingId, BindingKind } from '@ast/analyzeScopes'
 
 // Re-export the underlying functions/classes individually too, for consumers
 // who prefer named imports over the `luauparser` namespace object.
-export { tokenize, LexError, parse, parseTokens, parseExpressionFromSource, ParseError, print }
+export {
+    tokenize, LexError,
+    parse, parseTokens, parseExpressionFromSource, ParseError,
+    print,
+    analyzeScopes, getBinding, isGlobal, isUnassignedGlobal,
+}
 
 export const luauparser = {
     tokenize,
@@ -17,6 +24,10 @@ export const luauparser = {
     parse,
     parseExpressionFromSource,
     print,
+    analyzeScopes,
+    getBinding,
+    isGlobal,
+    isUnassignedGlobal
 } as const
 
 export default luauparser
