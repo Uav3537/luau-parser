@@ -405,5 +405,27 @@ declare class ParseError extends Error {
 }
 declare function parse(source: string): Program;
 declare function parseTokens(tokens: Token[]): Program;
+declare function parseExpressionFromSource(raw: string): Expression;
 
-export { type AssignmentStatement, type BaseNode, type BaseToken, type BinaryExpression, BinaryOperators, type Block, type BooleanLiteral, type BreakStatement, type CallExpression, type CallStatement, type CompoundAssignmentStatement, type ContinueStatement, type DoStatement, type EOFToken, type ExportTypeAliasStatement, type Expression, type FunctionBody, type FunctionDeclarationStatement, type FunctionExpression, type FunctionName, type FunctionParameter, type FunctionTypeNode, type FunctionTypeParameter, type GenericForStatement, type GenericTypeParameter, type Identifier, type IdentifierToken, type IfClause, type IfElseExpression, type IfStatement, type IndexExpression, type InterpolatedStringExpression, type InterpolatedStringPart, type InterpolatedStringPart_Expression, type InterpolatedStringPart_String, type InterpolatedStringToken, type IntersectionTypeNode, type KeywordToken, Keywords, LexError, type LiteralToken, type LocalFunctionStatement, type LocalStatement, type MemberExpression, type MethodCallExpression, type NilLiteral, type Node, type NumberLiteral, type NumericForStatement, type OperatorToken, Operators, type OptionalTypeNode, type ParenthesizedExpression, type ParenthesizedTypeNode, ParseError, type Program, type PunctuatorToken, Punctuators, type RepeatStatement, type ReturnStatement, type Statement, type StringLiteral, type TableExpression, type TableField, type TableTypeNode, type TableTypeProperty, type Token, type TypeAliasStatement, type TypeAssertionExpression, type TypeLiteralBoolean, type TypeLiteralString, type TypeNode, type TypePackNode, type TypeReference, type TypedIdentifier, type TypeofTypeNode, type UnaryExpression, UnaryOperators, type UnionTypeNode, type VarargExpression, type VariadicTypeNode, type WhileStatement, parse, parseTokens, tokenize };
+interface PrintOptions {
+    /** Quote character used when (re)generating string literals. Default: '"'. */
+    quote?: '"' | "'";
+}
+/**
+ * Renders an AST node back into Luau source code.
+ *
+ * Accepts a `Program`, a `Block`, any `Statement`, or any `Expression` /
+ * `TypeNode`, so it can be used both to print a whole file and to print
+ * a single fragment produced by a transform.
+ */
+declare function print(node: Node, options?: PrintOptions): string;
+
+declare const luauparser: {
+    readonly tokenize: typeof tokenize;
+    readonly parseTokens: typeof parseTokens;
+    readonly parse: typeof parse;
+    readonly parseExpressionFromSource: typeof parseExpressionFromSource;
+    readonly print: typeof print;
+};
+
+export { type AssignmentStatement, type BaseNode, type BaseToken, type BinaryExpression, BinaryOperators, type Block, type BooleanLiteral, type BreakStatement, type CallExpression, type CallStatement, type CompoundAssignmentStatement, type ContinueStatement, type DoStatement, type EOFToken, type ExportTypeAliasStatement, type Expression, type FunctionBody, type FunctionDeclarationStatement, type FunctionExpression, type FunctionName, type FunctionParameter, type FunctionTypeNode, type FunctionTypeParameter, type GenericForStatement, type GenericTypeParameter, type Identifier, type IdentifierToken, type IfClause, type IfElseExpression, type IfStatement, type IndexExpression, type InterpolatedStringExpression, type InterpolatedStringPart, type InterpolatedStringPart_Expression, type InterpolatedStringPart_String, type InterpolatedStringToken, type IntersectionTypeNode, type KeywordToken, Keywords, LexError, type LiteralToken, type LocalFunctionStatement, type LocalStatement, type MemberExpression, type MethodCallExpression, type NilLiteral, type Node, type NumberLiteral, type NumericForStatement, type OperatorToken, Operators, type OptionalTypeNode, type ParenthesizedExpression, type ParenthesizedTypeNode, ParseError, type PrintOptions, type Program, type PunctuatorToken, Punctuators, type RepeatStatement, type ReturnStatement, type Statement, type StringLiteral, type TableExpression, type TableField, type TableTypeNode, type TableTypeProperty, type Token, type TypeAliasStatement, type TypeAssertionExpression, type TypeLiteralBoolean, type TypeLiteralString, type TypeNode, type TypePackNode, type TypeReference, type TypedIdentifier, type TypeofTypeNode, type UnaryExpression, UnaryOperators, type UnionTypeNode, type VarargExpression, type VariadicTypeNode, type WhileStatement, luauparser as default, luauparser, parse, parseExpressionFromSource, parseTokens, print, tokenize };

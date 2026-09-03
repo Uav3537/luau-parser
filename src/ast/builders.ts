@@ -46,7 +46,7 @@ function spanFrom(start: Span, end: Span): Span {
 // Operator precedence
 // ------------------------------------------------------------
 
-const BINARY_PRECEDENCE: Record<string, number> = {
+export const BINARY_PRECEDENCE: Record<string, number> = {
     "or": 1,
     "and": 2,
     "<": 3, ">": 3, "<=": 3, ">=": 3, "~=": 3, "==": 3,
@@ -55,16 +55,16 @@ const BINARY_PRECEDENCE: Record<string, number> = {
     "*": 6, "/": 6, "//": 6, "%": 6,
     "^": 8,
 }
-const RIGHT_ASSOCIATIVE = new Set(["..", "^"])
-const UNARY_PRECEDENCE = 7
+export const RIGHT_ASSOCIATIVE = new Set(["..", "^"])
+export const UNARY_PRECEDENCE = 7
 
-const COMPOUND_ASSIGN_OPS = new Set(["+=", "-=", "*=", "/=", "//=", "%=", "^=", "..="])
+export const COMPOUND_ASSIGN_OPS = new Set(["+=", "-=", "*=", "/=", "//=", "%=", "^=", "..="])
 
 // ============================================================
 // Parser
 // ============================================================
 
-class Parser {
+export class Parser {
     private tokens: Token[]
     private cursor = 0
 
@@ -893,11 +893,17 @@ class Parser {
             const start = this.current()
             const base = this.expectIdentifier().value as string
             this.advance()
+            const packRef: TypeReference = { type: "TypeReference", base, typeArguments: [], ...spanFrom(start, start) }
             return {
                 type: "TypePackNode",
                 types: [],
                 hasVarargs: true,
-                varargType: { type: "TypeReference", base, typeArguments: [], ...spanFrom(start, start) } as TypeReference,
+                // Wrap in `VariadicTypeNode`, matching the convention used by
+                // `parseFunctionTypeAfterParen`'s identifier-pack-reference
+                // branch, so the printer can tell `A...` (name-first, this
+                // case) apart from `...T` (dots-first) and append rather
+                // than prepend the `...`.
+                varargType: { type: "VariadicTypeNode", typeAnnotation: packRef, ...spanFrom(start, this.previous()) } as VariadicTypeNode,
                 ...spanFrom(start, this.previous()),
             } as TypePackNode
         }
@@ -1257,7 +1263,7 @@ export function parseTokens(tokens: Token[]): Program {
     return parser.parseProgram()
 }
 
-function parseExpressionFromSource(raw: string): Expression {
+export function parseExpressionFromSource(raw: string): Expression {
     const tokens = tokenize(raw)
     const parser = new Parser(tokens)
     const expr = (parser as any).parseExpression() as Expression
