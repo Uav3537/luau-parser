@@ -910,6 +910,16 @@ export class Parser {
         return this.parseType()
     }
 
+    private parseTypeArgument(): TypeNode | TypePackNode {
+        if (this.checkOperator("...")) {
+            return this.parseTypePack()
+        }
+        if (this.checkType("Identifier") && this.peek(1).type === "Operator" && (this.peek(1) as any).value === "...") {
+            return this.parseTypeOrTypePackReference()
+        }
+        return this.parseType()
+    }
+
     private parseFunctionBody(): FunctionBody {
         const start = this.current()
         let generics: GenericTypeParameter[] = []
@@ -1064,13 +1074,13 @@ export class Parser {
                 namespace = base
                 base = this.expectIdentifier().value as string
             }
-            const typeArguments: TypeNode[] = []
+            const typeArguments: (TypeNode | TypePackNode)[] = []
             if (this.checkOperator("<")) {
                 this.advance()
                 if (!this.checkOperator(">")) {
-                    typeArguments.push(this.parseType())
+                    typeArguments.push(this.parseTypeArgument())
                     while (this.matchPunctuator(",")) {
-                        typeArguments.push(this.parseType())
+                        typeArguments.push(this.parseTypeArgument())
                     }
                 }
                 this.expectOperator(">")

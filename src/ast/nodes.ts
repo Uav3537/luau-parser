@@ -360,7 +360,7 @@ export interface TypeReference extends BaseNode {
     type: "TypeReference"
     base: string
     namespace?: string
-    typeArguments: TypeNode[]
+    typeArguments: (TypeNode | TypePackNode)[]
 }
 
 export interface TypeLiteralString extends BaseNode {
