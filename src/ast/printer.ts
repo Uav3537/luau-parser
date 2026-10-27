@@ -22,13 +22,42 @@ import type {
 // Public API
 // ============================================================
 
+export type Syntax = "luau" | "lua51"
+
 export interface PrintOptions {
     /** Quote character used when (re)generating string literals. Default: '"'. */
     quote?: '"' | "'"
+    /**
+     * Indentation applied per block level: `"\t"` or a number of spaces.
+     * Default: no indentation. Ignored when `compact` is set.
+     */
+    indent?: "\t" | number
+    /**
+     * Target dialect. `"lua51"` throws a `PrintError` on any node that has
+     * no Lua 5.1 equivalent (`+=`, `continue`, if-expressions, type
+     * annotations, interpolated strings, ...) instead of lowering it.
+     * Default: `"luau"`.
+     */
+    syntax?: Syntax
+    /**
+     * Emits the whole output on a single line, separating statements with a
+     * space and only falling back to `;` where the next statement starts
+     * with `(` (which would otherwise be read as a call). Default: false.
+     */
+    compact?: boolean
 }
 
 const DEFAULT_OPTIONS: Required<PrintOptions> = {
     quote: '"',
+    indent: 0,
+    syntax: "luau",
+    compact: false,
+}
+
+export class PrintError extends Error {
+    constructor(message: string, public line?: number, public column?: number) {
+        super(line !== undefined ? `${message} (${line}:${column})` : message)
+    }
 }
 
 /**
@@ -71,9 +100,26 @@ function isRightAssociative(op: string): boolean {
 
 class Printer {
     private quote: '"' | "'"
+    private indentUnit: string
+    private syntax: Syntax
+    private compact: boolean
+    private depth = 0
 
     constructor(opts: Required<PrintOptions>) {
         this.quote = opts.quote
+        this.indentUnit = typeof opts.indent === "number" ? " ".repeat(opts.indent) : opts.indent
+        this.syntax = opts.syntax
+        this.compact = opts.compact
+    }
+
+    /** Throws when printing for Lua 5.1 and `feature` only exists in Luau. */
+    private requireLuau(feature: string, node?: { line?: { start: number }; column?: { start: number } }): void {
+        if (this.syntax !== "lua51") return
+        throw new PrintError(`${feature} is not supported in Lua 5.1`, node?.line?.start, node?.column?.start)
+    }
+
+    private pad(): string {
+        return this.compact ? "" : this.indentUnit.repeat(this.depth)
     }
 
     printNode(node: Node): string {
@@ -98,15 +144,42 @@ class Printer {
     // --------------------------------------------------------
 
     /**
-     * Prints the statements of a block, one per line, each terminated with
-     * `;`. No indentation is applied — this printer favors bundler-style
-     * compact output over pretty-printing.
+     * Prints the statements of a block at the current depth, one per line,
+     * each terminated with `;`. In compact mode statements are joined by a
+     * space instead, keeping `;` only in front of a statement that starts
+     * with `(` — otherwise `a = b (f)()` would re-parse as `a = b(f)()`.
      */
     private printBlock(block: Block): string {
-        return block.statements.map(s => this.printStatement(s) + ";").join("\n")
+        const pad = this.pad()
+        const printed = block.statements.map(s => this.printStatement(s))
+        if (!this.compact) return printed.map(s => pad + s + ";").join("\n")
+        let out = ""
+        printed.forEach((s, i) => {
+            if (i > 0) out += s.startsWith("(") ? ";" : " "
+            out += s
+        })
+        return out
+    }
+
+    /**
+     * Prints a nested block one level deeper, including the line breaks
+     * around it, so callers can write `do${body}end`.
+     */
+    private printBody(block: Block): string {
+        this.depth++
+        const inner = this.printBlock(block)
+        this.depth--
+        if (this.compact) return inner ? ` ${inner} ` : " "
+        return `\n${inner}\n${this.pad()}`
     }
 
     private printStatement(stmt: Statement): string {
+        switch (stmt.type) {
+            case "CompoundAssignmentStatement": this.requireLuau("compound assignment", stmt); break
+            case "ContinueStatement": this.requireLuau("'continue'", stmt); break
+            case "TypeAliasStatement":
+            case "ExportTypeAliasStatement": this.requireLuau("type alias", stmt); break
+        }
         switch (stmt.type) {
             case "LocalStatement": return this.printLocalStatement(stmt)
             case "LocalFunctionStatement": return this.printLocalFunctionStatement(stmt)
@@ -128,12 +201,15 @@ class Printer {
         }
     }
 
-    private printAttributes(attributes?: string[]): string {
+    private printAttributes(attributes: string[] | undefined, node: Statement): string {
         if (!attributes || attributes.length === 0) return ""
-        return attributes.map(a => `@${a}\n`).join("")
+        this.requireLuau("function attribute", node)
+        const sep = this.compact ? " " : "\n" + this.pad()
+        return attributes.map(a => `@${a}${sep}`).join("")
     }
 
     private printLocalStatement(stmt: LocalStatement): string {
+        if (stmt.isConst) this.requireLuau("'const'", stmt)
         const kw = stmt.isConst ? "const" : "local"
         const names = stmt.names.map(n => this.printTypedIdentifier(n)).join(", ")
         if (stmt.init.length === 0) {
@@ -144,8 +220,9 @@ class Printer {
     }
 
     private printLocalFunctionStatement(stmt: LocalFunctionStatement): string {
+        if (stmt.isConst) this.requireLuau("'const'", stmt)
         const kw = stmt.isConst ? "const function" : "local function"
-        return `${this.printAttributes(stmt.attributes)}${kw} ${stmt.name.name}${this.printFunctionBody(stmt.func)}`
+        return `${this.printAttributes(stmt.attributes, stmt)}${kw} ${stmt.name.name}${this.printFunctionBody(stmt.func)}`
     }
 
     private printFunctionDeclarationStatement(stmt: FunctionDeclarationStatement): string {
@@ -155,7 +232,7 @@ class Printer {
         const func = stmt.isMethod && stmt.func.params[0]?.name === "self"
             ? { ...stmt.func, params: stmt.func.params.slice(1) }
             : stmt.func
-        return `${this.printAttributes(stmt.attributes)}function ${this.printFunctionName(stmt.target)}${this.printFunctionBody(func)}`
+        return `${this.printAttributes(stmt.attributes, stmt)}function ${this.printFunctionName(stmt.target)}${this.printFunctionBody(func)}`
     }
 
     private printFunctionName(name: FunctionName): string {
@@ -176,25 +253,25 @@ class Printer {
     }
 
     private printDoStatement(stmt: DoStatement): string {
-        return `do\n${this.printBlock(stmt.body)}\nend`
+        return `do${this.printBody(stmt.body)}end`
     }
 
     private printWhileStatement(stmt: WhileStatement): string {
-        return `while ${this.printExpression(stmt.condition)} do\n${this.printBlock(stmt.body)}\nend`
+        return `while ${this.printExpression(stmt.condition)} do${this.printBody(stmt.body)}end`
     }
 
     private printRepeatStatement(stmt: RepeatStatement): string {
-        return `repeat\n${this.printBlock(stmt.body)}\nuntil ${this.printExpression(stmt.condition)}`
+        return `repeat${this.printBody(stmt.body)}until ${this.printExpression(stmt.condition)}`
     }
 
     private printIfStatement(stmt: IfStatement): string {
         let out = ""
         stmt.clauses.forEach((clause: IfClause, i: number) => {
             const kw = i === 0 ? "if" : "elseif"
-            out += `${kw} ${this.printExpression(clause.condition)} then\n${this.printBlock(clause.body)}\n`
+            out += `${kw} ${this.printExpression(clause.condition)} then${this.printBody(clause.body)}`
         })
         if (stmt.alternate) {
-            out += `else\n${this.printBlock(stmt.alternate)}\n`
+            out += `else${this.printBody(stmt.alternate)}`
         }
         out += "end"
         return out
@@ -202,13 +279,13 @@ class Printer {
 
     private printNumericForStatement(stmt: NumericForStatement): string {
         const step = stmt.step ? `, ${this.printExpression(stmt.step)}` : ""
-        return `for ${this.printTypedIdentifier(stmt.variable)} = ${this.printExpression(stmt.start)}, ${this.printExpression(stmt.end)}${step} do\n${this.printBlock(stmt.body)}\nend`
+        return `for ${this.printTypedIdentifier(stmt.variable)} = ${this.printExpression(stmt.start)}, ${this.printExpression(stmt.end)}${step} do${this.printBody(stmt.body)}end`
     }
 
     private printGenericForStatement(stmt: GenericForStatement): string {
         const names = stmt.variables.map(v => this.printTypedIdentifier(v)).join(", ")
         const iterators = stmt.iterators.map(e => this.printExpression(e)).join(", ")
-        return `for ${names} in ${iterators} do\n${this.printBlock(stmt.body)}\nend`
+        return `for ${names} in ${iterators} do${this.printBody(stmt.body)}end`
     }
 
     private printReturnStatement(stmt: ReturnStatement): string {
@@ -223,6 +300,7 @@ class Printer {
 
     private printGenericTypeParameterList(generics: GenericTypeParameter[]): string {
         if (!generics || generics.length === 0) return ""
+        this.requireLuau("generic type parameters", generics[0])
         return `<${generics.map(g => this.printGenericTypeParameter(g)).join(", ")}>`
     }
 
@@ -239,6 +317,7 @@ class Printer {
     // --------------------------------------------------------
 
     private printTypedIdentifier(id: TypedIdentifier): string {
+        if (id.attributes && id.attributes.length > 0) this.requireLuau("local attribute", id)
         const attrs = id.attributes && id.attributes.length > 0
             ? id.attributes.map(a => `<${a}>`).join(" ") + " "
             : ""
@@ -259,7 +338,7 @@ class Printer {
             params.push(`...${type}`)
         }
         const returnType = func.returnType ? `: ${this.printType(func.returnType)}` : ""
-        return `${generics}(${params.join(", ")})${returnType}\n${this.printBlock(func.body)}\nend`
+        return `${generics}(${params.join(", ")})${returnType}${this.printBody(func.body)}end`
     }
 
     // --------------------------------------------------------
@@ -267,6 +346,11 @@ class Printer {
     // --------------------------------------------------------
 
     private printExpression(expr: Expression): string {
+        switch (expr.type) {
+            case "InterpolatedStringExpression": this.requireLuau("interpolated string", expr); break
+            case "TypeAssertionExpression": this.requireLuau("type assertion", expr); break
+            case "IfElseExpression": this.requireLuau("if-expression", expr); break
+        }
         switch (expr.type) {
             case "Identifier": return expr.name
             case "NilLiteral": return "nil"
@@ -290,7 +374,11 @@ class Printer {
     }
 
     private printNumberLiteral(lit: NumberLiteral): string {
-        return lit.raw !== undefined && lit.raw !== "" ? lit.raw : String(lit.value)
+        if (lit.raw === undefined || lit.raw === "") return String(lit.value)
+        // Binary literals and `_` digit separators are only Luau spellings of
+        // an ordinary number, so they are re-spelled rather than rejected.
+        if (this.syntax === "lua51" && isLuauOnlyNumber(lit.raw)) return formatNumber(lit.value)
+        return lit.raw
     }
 
     private printStringLiteral(lit: StringLiteral): string {
@@ -300,13 +388,16 @@ class Printer {
     private quoteString(value: string): string {
         const q = this.quote
         let out = q
-        for (const ch of value) {
+        const chars = [...value]
+        for (let i = 0; i < chars.length; i++) {
+            const ch = chars[i]
             switch (ch) {
                 case "\\": out += "\\\\"; break
                 case "\n": out += "\\n"; break
                 case "\r": out += "\\r"; break
                 case "\t": out += "\\t"; break
-                case "\0": out += "\\0"; break
+                // A digit right after `\0` would be read as part of the decimal escape.
+                case "\0": out += isDigitChar(chars[i + 1]) ? "\\000" : "\\0"; break
                 case q: out += "\\" + q; break
                 default: out += ch
             }
@@ -343,8 +434,12 @@ class Printer {
 
     private printTableExpression(expr: TableExpression): string {
         if (expr.fields.length === 0) return "{}"
-        const inner = expr.fields.map(f => this.printTableField(f)).join(",\n")
-        return `{\n${inner}\n}`
+        if (this.compact) return `{${expr.fields.map(f => this.printTableField(f)).join(", ")}}`
+        this.depth++
+        const pad = this.pad()
+        const inner = expr.fields.map(f => pad + this.printTableField(f)).join(",\n")
+        this.depth--
+        return `{\n${inner}\n${this.pad()}}`
     }
 
     private printTableField(field: TableField): string {
@@ -356,6 +451,7 @@ class Printer {
     }
 
     private printBinaryExpression(expr: BinaryExpression): string {
+        if (expr.operator === "//") this.requireLuau("floor division '//'", expr)
         const left = this.printChildForBinary(expr.left, expr, "left")
         const right = this.printChildForBinary(expr.right, expr, "right")
         return `${left} ${expr.operator} ${right}`
@@ -450,6 +546,7 @@ class Printer {
     // --------------------------------------------------------
 
     private printType(t: TypeNode): string {
+        this.requireLuau("type annotation", t)
         switch (t.type) {
             case "TypeReference": return this.printTypeReference(t)
             case "TypeLiteralString": return this.quoteString(t.value)
@@ -604,6 +701,21 @@ function isSimpleOperand(expr: Expression): boolean {
         default:
             return false
     }
+}
+
+function isDigitChar(ch: string | undefined): boolean {
+    return ch !== undefined && ch >= "0" && ch <= "9"
+}
+
+/** Number spellings Lua 5.1's lexer rejects: binary literals and `_` separators. */
+export function isLuauOnlyNumber(raw: string): boolean {
+    return /^0[bB]/.test(raw) || raw.includes("_")
+}
+
+function formatNumber(value: number): string {
+    // `1e999` overflows to inf in both Lua 5.1 and Luau.
+    if (value === Infinity) return "1e999"
+    return String(value)
 }
 
 function isTypePackNode(t: TypeNode | TypePackNode): t is TypePackNode {

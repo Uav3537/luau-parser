@@ -1,11 +1,12 @@
 import { parse, parseTokens, parseExpressionFromSource, ParseError } from '@ast/builders'
 import { tokenize, LexError } from '@lexer/lexer'
-import { print } from '@ast/printer'
+import { print, PrintError } from '@ast/printer'
 
 // Re-export every AST/token type so consumers can `import type { ... } from "luau-parser"`.
 export * from '@lexer/token'
 export * from '@ast/nodes'
-export type { PrintOptions } from '@ast/printer'
+export type { PrintOptions, Syntax } from '@ast/printer'
+export type { ParseOptions } from '@ast/builders'
 import { analyzeScopes, getBinding, isGlobal, isUnassignedGlobal } from '@ast/analyzeScopes'
 export type { ScopeAnalysis, Binding, BindingId, BindingKind } from '@ast/analyzeScopes'
 
@@ -14,7 +15,7 @@ export type { ScopeAnalysis, Binding, BindingId, BindingKind } from '@ast/analyz
 export {
     tokenize, LexError,
     parse, parseTokens, parseExpressionFromSource, ParseError,
-    print,
+    print, PrintError,
     analyzeScopes, getBinding, isGlobal, isUnassignedGlobal,
 }
 

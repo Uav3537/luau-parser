@@ -335,7 +335,7 @@ interface TypeReference extends BaseNode {
     type: "TypeReference";
     base: string;
     namespace?: string;
-    typeArguments: TypeNode[];
+    typeArguments: (TypeNode | TypePackNode)[];
 }
 interface TypeLiteralString extends BaseNode {
     type: "TypeLiteralString";
@@ -398,18 +398,33 @@ interface VariadicTypeNode extends BaseNode {
 }
 type Node = Program | Block | Statement | Expression | TypeNode | FunctionBody | FunctionParameter | FunctionName | IfClause | TypedIdentifier | GenericTypeParameter | TableField | FunctionTypeParameter | TableTypeProperty;
 
-declare class ParseError extends Error {
-    line: number;
-    column: number;
-    constructor(message: string, line: number, column: number);
-}
-declare function parse(source: string): Program;
-declare function parseTokens(tokens: Token[]): Program;
-declare function parseExpressionFromSource(raw: string): Expression;
-
+type Syntax = "luau" | "lua51";
 interface PrintOptions {
     /** Quote character used when (re)generating string literals. Default: '"'. */
     quote?: '"' | "'";
+    /**
+     * Indentation applied per block level: `"\t"` or a number of spaces.
+     * Default: no indentation. Ignored when `compact` is set.
+     */
+    indent?: "\t" | number;
+    /**
+     * Target dialect. `"lua51"` throws a `PrintError` on any node that has
+     * no Lua 5.1 equivalent (`+=`, `continue`, if-expressions, type
+     * annotations, interpolated strings, ...) instead of lowering it.
+     * Default: `"luau"`.
+     */
+    syntax?: Syntax;
+    /**
+     * Emits the whole output on a single line, separating statements with a
+     * space and only falling back to `;` where the next statement starts
+     * with `(` (which would otherwise be read as a call). Default: false.
+     */
+    compact?: boolean;
+}
+declare class PrintError extends Error {
+    line?: number | undefined;
+    column?: number | undefined;
+    constructor(message: string, line?: number | undefined, column?: number | undefined);
 }
 /**
  * Renders an AST node back into Luau source code.
@@ -419,6 +434,23 @@ interface PrintOptions {
  * a single fragment produced by a transform.
  */
 declare function print(node: Node, options?: PrintOptions): string;
+
+interface ParseOptions {
+    /**
+     * Accepted dialect. `"lua51"` throws a `ParseError` on any Luau-only
+     * syntax (`+=`, `continue`, type annotations, if-expressions, ...).
+     * Default: `"luau"`.
+     */
+    syntax?: Syntax;
+}
+declare class ParseError extends Error {
+    line: number;
+    column: number;
+    constructor(message: string, line: number, column: number);
+}
+declare function parse(source: string, options?: ParseOptions): Program;
+declare function parseTokens(tokens: Token[], options?: ParseOptions): Program;
+declare function parseExpressionFromSource(raw: string): Expression;
 
 type BindingId = number;
 type BindingKind = "local" | "param" | "self" | "for-numeric" | "for-generic" | "global";
@@ -488,4 +520,4 @@ declare const luauparser: {
     readonly isUnassignedGlobal: typeof isUnassignedGlobal;
 };
 
-export { type AssignmentStatement, type BaseNode, type BaseToken, type BinaryExpression, BinaryOperators, type Binding, type BindingId, type BindingKind, type Block, type BooleanLiteral, type BreakStatement, type CallExpression, type CallStatement, type CompoundAssignmentStatement, type ContinueStatement, type DoStatement, type EOFToken, type ExportTypeAliasStatement, type Expression, type FunctionBody, type FunctionDeclarationStatement, type FunctionExpression, type FunctionName, type FunctionParameter, type FunctionTypeNode, type FunctionTypeParameter, type GenericForStatement, type GenericTypeParameter, type Identifier, type IdentifierToken, type IfClause, type IfElseExpression, type IfStatement, type IndexExpression, type InterpolatedStringExpression, type InterpolatedStringPart, type InterpolatedStringPart_Expression, type InterpolatedStringPart_String, type InterpolatedStringToken, type IntersectionTypeNode, type KeywordToken, Keywords, LexError, type LiteralToken, type LocalFunctionStatement, type LocalStatement, type MemberExpression, type MethodCallExpression, type NilLiteral, type Node, type NumberLiteral, type NumericForStatement, type OperatorToken, Operators, type OptionalTypeNode, type ParenthesizedExpression, type ParenthesizedTypeNode, ParseError, type PrintOptions, type Program, type PunctuatorToken, Punctuators, type RepeatStatement, type ReturnStatement, type ScopeAnalysis, type Statement, type StringLiteral, type TableExpression, type TableField, type TableTypeNode, type TableTypeProperty, type Token, type TypeAliasStatement, type TypeAssertionExpression, type TypeLiteralBoolean, type TypeLiteralString, type TypeNode, type TypePackNode, type TypeReference, type TypedIdentifier, type TypeofTypeNode, type UnaryExpression, UnaryOperators, type UnionTypeNode, type VarargExpression, type VariadicTypeNode, type WhileStatement, analyzeScopes, luauparser as default, getBinding, isGlobal, isUnassignedGlobal, luauparser, parse, parseExpressionFromSource, parseTokens, print, tokenize };
+export { type AssignmentStatement, type BaseNode, type BaseToken, type BinaryExpression, BinaryOperators, type Binding, type BindingId, type BindingKind, type Block, type BooleanLiteral, type BreakStatement, type CallExpression, type CallStatement, type CompoundAssignmentStatement, type ContinueStatement, type DoStatement, type EOFToken, type ExportTypeAliasStatement, type Expression, type FunctionBody, type FunctionDeclarationStatement, type FunctionExpression, type FunctionName, type FunctionParameter, type FunctionTypeNode, type FunctionTypeParameter, type GenericForStatement, type GenericTypeParameter, type Identifier, type IdentifierToken, type IfClause, type IfElseExpression, type IfStatement, type IndexExpression, type InterpolatedStringExpression, type InterpolatedStringPart, type InterpolatedStringPart_Expression, type InterpolatedStringPart_String, type InterpolatedStringToken, type IntersectionTypeNode, type KeywordToken, Keywords, LexError, type LiteralToken, type LocalFunctionStatement, type LocalStatement, type MemberExpression, type MethodCallExpression, type NilLiteral, type Node, type NumberLiteral, type NumericForStatement, type OperatorToken, Operators, type OptionalTypeNode, type ParenthesizedExpression, type ParenthesizedTypeNode, ParseError, type ParseOptions, PrintError, type PrintOptions, type Program, type PunctuatorToken, Punctuators, type RepeatStatement, type ReturnStatement, type ScopeAnalysis, type Statement, type StringLiteral, type Syntax, type TableExpression, type TableField, type TableTypeNode, type TableTypeProperty, type Token, type TypeAliasStatement, type TypeAssertionExpression, type TypeLiteralBoolean, type TypeLiteralString, type TypeNode, type TypePackNode, type TypeReference, type TypedIdentifier, type TypeofTypeNode, type UnaryExpression, UnaryOperators, type UnionTypeNode, type VarargExpression, type VariadicTypeNode, type WhileStatement, analyzeScopes, luauparser as default, getBinding, isGlobal, isUnassignedGlobal, luauparser, parse, parseExpressionFromSource, parseTokens, print, tokenize };

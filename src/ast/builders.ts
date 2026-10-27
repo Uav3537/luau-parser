@@ -19,6 +19,16 @@ import type {
     UnionTypeNode, IntersectionTypeNode, OptionalTypeNode,
     ParenthesizedTypeNode, TypeofTypeNode, VariadicTypeNode, TypePackNode,
 } from "@ast/nodes"
+import { isLuauOnlyNumber, type Syntax } from "@ast/printer"
+
+export interface ParseOptions {
+    /**
+     * Accepted dialect. `"lua51"` throws a `ParseError` on any Luau-only
+     * syntax (`+=`, `continue`, type annotations, if-expressions, ...).
+     * Default: `"luau"`.
+     */
+    syntax?: Syntax
+}
 
 export class ParseError extends Error {
     constructor(message: string, public line: number, public column: number) {
@@ -67,9 +77,17 @@ export const COMPOUND_ASSIGN_OPS = new Set(["+=", "-=", "*=", "/=", "//=", "%=",
 export class Parser {
     private tokens: Token[]
     private cursor = 0
+    private syntax: Syntax
 
-    constructor(tokens: Token[]) {
+    constructor(tokens: Token[], options?: ParseOptions) {
         this.tokens = tokens
+        this.syntax = options?.syntax ?? "luau"
+    }
+
+    /** Throws when parsing as Lua 5.1 and `feature` only exists in Luau. */
+    private requireLuau(feature: string, at: Span = this.current()): void {
+        if (this.syntax !== "lua51") return
+        throw new ParseError(`${feature} is not supported in Lua 5.1`, at.line.start, at.column.start)
     }
 
     private current(): Token {
@@ -219,6 +237,7 @@ export class Parser {
         const t = this.current()
 
         if (t.type === "Punctuator" && (t as any).value === "@") {
+            this.requireLuau("function attribute", t)
             const { attributes, start } = this.parseAttributes()
             const next = this.current()
             if (next.type === "Keyword" && (next as any).value === "local") {
@@ -264,6 +283,7 @@ export class Parser {
                     return { type: "BreakStatement", ...spanFrom(t, this.previous()) } as BreakStatement
                 }
                 case "continue": {
+                    this.requireLuau("'continue'", t)
                     this.advance()
                     return { type: "ContinueStatement", ...spanFrom(t, this.previous()) } as ContinueStatement
                 }
@@ -326,6 +346,7 @@ export class Parser {
 
     private parseConstStatement(): LocalStatement | LocalFunctionStatement {
         const start = this.current()
+        this.requireLuau("'const'", start)
         this.advance() // consume 'const'
 
         if (this.matchKeyword("function")) {
@@ -353,6 +374,7 @@ export class Parser {
         let attributes: string[] | undefined
 
         if (this.checkOperator("<")) {
+            this.requireLuau("local attribute")
             this.advance()
             attributes = []
             attributes.push(this.expectIdentifier().value as string)
@@ -363,6 +385,7 @@ export class Parser {
         }
 
         if (this.matchPunctuator(":")) {
+            this.requireLuau("type annotation", this.previous())
             typeAnnotation = this.parseType()
         }
 
@@ -379,6 +402,7 @@ export class Parser {
         const nameTok = this.expectIdentifier()
         let typeAnnotation: TypeNode | undefined
         if (this.matchPunctuator(":")) {
+            this.requireLuau("type annotation", this.previous())
             typeAnnotation = this.parseType()
         }
         return {
@@ -544,6 +568,7 @@ export class Parser {
 
     private parseTypeAliasStatement(): TypeAliasStatement {
         const start = this.current()
+        this.requireLuau("type alias", start)
         this.advance()
         const nameTok = this.expectIdentifier()
         const name: Identifier = { type: "Identifier", name: nameTok.value as string, ...spanFrom(nameTok, nameTok) }
@@ -559,6 +584,7 @@ export class Parser {
 
     private parseExportTypeAliasStatement(): ExportTypeAliasStatement {
         const start = this.current()
+        this.requireLuau("type alias", start)
         this.advance()
         const alias = this.parseTypeAliasStatement()
         return { type: "ExportTypeAliasStatement", alias, ...spanFrom(start, this.previous()) }
@@ -580,6 +606,7 @@ export class Parser {
 
         const t = this.current()
         if (t.type === "Operator" && COMPOUND_ASSIGN_OPS.has((t as any).value)) {
+            this.requireLuau("compound assignment", t)
             const op = (this.advance() as any).value
             const value = this.parseExpression()
             return {
@@ -637,6 +664,7 @@ export class Parser {
             const prec = BINARY_PRECEDENCE[op]
             if (prec < minPrec) break
 
+            if (op === "//") this.requireLuau("floor division '//'")
             this.advance()
             const rightAssoc = RIGHT_ASSOCIATIVE.has(op)
             const nextMinPrec = rightAssoc ? prec : prec + 1
@@ -670,6 +698,7 @@ export class Parser {
     private parseAtomWithAssertion(): Expression {
         let expr = this.parseAtom()
         while (this.checkPunctuator("::")) {
+            this.requireLuau("type assertion")
             this.advance()
             const typeAnnotation = this.parseType()
             expr = {
@@ -694,8 +723,10 @@ export class Parser {
                 case "boolean":
                     return { type: "BooleanLiteral", value: lit.value, ...spanFrom(t, t) } as BooleanLiteral
                 case "number":
+                    if (isLuauOnlyNumber(lit.raw)) this.requireLuau(`number literal '${lit.raw}'`, t)
                     return { type: "NumberLiteral", value: lit.value, raw: lit.raw, ...spanFrom(t, t) } as NumberLiteral
                 case "string":
+                    this.checkStringEscapes(t)
                     return { type: "StringLiteral", value: lit.value, raw: lit.raw, ...spanFrom(t, t) } as StringLiteral
             }
         }
@@ -731,10 +762,26 @@ export class Parser {
         this.error("Unexpected token in expression")
     }
 
+    /** Rejects the `\x`, `\z` and `\u` escapes Lua 5.1 doesn't have. */
+    private checkStringEscapes(t: Token): void {
+        if (this.syntax !== "lua51") return
+        const raw = (t as any).raw as string
+        // Long strings (`[[...]]`) have no escapes at all.
+        if (raw.startsWith("[")) return
+        for (let i = 0; i < raw.length; i++) {
+            if (raw[i] !== "\\") continue
+            const next = raw[++i]
+            if (next === "x" || next === "z" || next === "u") {
+                this.requireLuau(`string escape '\\${next}'`, t)
+            }
+        }
+    }
+
     private buildInterpolatedString(token: {
         parts: { kind: "string"; value: string; raw: string }[] | any
         line: any; column: any
     }): InterpolatedStringExpression {
+        this.requireLuau("interpolated string", token)
         const parts: InterpolatedStringPart[] = []
         for (const p of (token as any).parts as any[]) {
             if (p.kind === "string") {
@@ -749,6 +796,7 @@ export class Parser {
 
     private parseIfElseExpression(): IfElseExpression {
         const start = this.current()
+        this.requireLuau("if-expression", start)
         this.expectKeyword("if")
         const clauses: { condition: Expression; body: Expression }[] = []
         const cond = this.parseExpression()
@@ -834,6 +882,7 @@ export class Parser {
 
         const t = this.current()
         if (t.type === "Literal" && (t as any).kind === "string") {
+            this.checkStringEscapes(t)
             this.advance()
             return [{ type: "StringLiteral", value: (t as any).value, raw: (t as any).raw, ...spanFrom(t, t) }]
         }
@@ -924,6 +973,7 @@ export class Parser {
         const start = this.current()
         let generics: GenericTypeParameter[] = []
         if (this.checkOperator("<")) {
+            this.requireLuau("generic type parameters")
             generics = this.parseGenericTypeParameterList()
         }
 
@@ -938,6 +988,7 @@ export class Parser {
                     this.advance()
                     hasVarargs = true
                     if (this.matchPunctuator(":")) {
+                        this.requireLuau("type annotation", this.previous())
                         varargTypeAnnotation = this.parseTypeOrTypePackReference()
                     }
                     break
@@ -945,6 +996,7 @@ export class Parser {
                 const nameTok = this.expectIdentifier()
                 let typeAnnotation: TypeNode | undefined
                 if (this.matchPunctuator(":")) {
+                    this.requireLuau("type annotation", this.previous())
                     typeAnnotation = this.parseType()
                 }
                 params.push({
@@ -961,6 +1013,7 @@ export class Parser {
 
         let returnType: TypeNode | undefined
         if (this.matchPunctuator(":")) {
+            this.requireLuau("type annotation", this.previous())
             returnType = this.parseTypeOrTypePackReference()
         }
 
@@ -1262,14 +1315,14 @@ export class Parser {
 // Public API
 // ============================================================
 
-export function parse(source: string): Program {
+export function parse(source: string, options?: ParseOptions): Program {
     const tokens = tokenize(source)
-    const parser = new Parser(tokens)
+    const parser = new Parser(tokens, options)
     return parser.parseProgram()
 }
 
-export function parseTokens(tokens: Token[]): Program {
-    const parser = new Parser(tokens)
+export function parseTokens(tokens: Token[], options?: ParseOptions): Program {
+    const parser = new Parser(tokens, options)
     return parser.parseProgram()
 }
 

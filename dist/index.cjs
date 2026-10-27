@@ -25,6 +25,7 @@ __export(index_exports, {
   LexError: () => LexError,
   Operators: () => Operators,
   ParseError: () => ParseError,
+  PrintError: () => PrintError,
   Punctuators: () => Punctuators,
   UnaryOperators: () => UnaryOperators,
   analyzeScopes: () => analyzeScopes,
@@ -558,6 +559,695 @@ function tokenize(source) {
   return tokens;
 }
 
+// src/ast/printer.ts
+var DEFAULT_OPTIONS = {
+  quote: '"',
+  indent: 0,
+  syntax: "luau",
+  compact: false
+};
+var PrintError = class extends Error {
+  constructor(message, line, column) {
+    super(line !== void 0 ? `${message} (${line}:${column})` : message);
+    this.line = line;
+    this.column = column;
+  }
+  line;
+  column;
+};
+function print(node, options) {
+  const opts = { ...DEFAULT_OPTIONS, ...options };
+  const printer = new Printer(opts);
+  return printer.printNode(node);
+}
+var BINARY_PRECEDENCE = {
+  or: 1,
+  and: 2,
+  "<": 3,
+  ">": 3,
+  "<=": 3,
+  ">=": 3,
+  "~=": 3,
+  "==": 3,
+  "..": 4,
+  "+": 5,
+  "-": 5,
+  "*": 6,
+  "/": 6,
+  "//": 6,
+  "%": 6,
+  "^": 8
+};
+var UNARY_PRECEDENCE = 7;
+function isRightAssociative(op) {
+  return op === ".." || op === "^";
+}
+var Printer = class {
+  quote;
+  indentUnit;
+  syntax;
+  compact;
+  depth = 0;
+  constructor(opts) {
+    this.quote = opts.quote;
+    this.indentUnit = typeof opts.indent === "number" ? " ".repeat(opts.indent) : opts.indent;
+    this.syntax = opts.syntax;
+    this.compact = opts.compact;
+  }
+  /** Throws when printing for Lua 5.1 and `feature` only exists in Luau. */
+  requireLuau(feature, node) {
+    if (this.syntax !== "lua51") return;
+    throw new PrintError(`${feature} is not supported in Lua 5.1`, node?.line?.start, node?.column?.start);
+  }
+  pad() {
+    return this.compact ? "" : this.indentUnit.repeat(this.depth);
+  }
+  printNode(node) {
+    switch (node.type) {
+      case "Program":
+        return this.printBlock(node.body);
+      case "Block":
+        return this.printBlock(node);
+      default:
+        if (isStatementType(node.type)) {
+          return this.printStatement(node);
+        }
+        if (isTypeNodeType(node.type)) {
+          return this.printType(node);
+        }
+        return this.printExpression(node);
+    }
+  }
+  // --------------------------------------------------------
+  // Block / Statements
+  // --------------------------------------------------------
+  /**
+   * Prints the statements of a block at the current depth, one per line,
+   * each terminated with `;`. In compact mode statements are joined by a
+   * space instead, keeping `;` only in front of a statement that starts
+   * with `(` — otherwise `a = b (f)()` would re-parse as `a = b(f)()`.
+   */
+  printBlock(block) {
+    const pad = this.pad();
+    const printed = block.statements.map((s) => this.printStatement(s));
+    if (!this.compact) return printed.map((s) => pad + s + ";").join("\n");
+    let out = "";
+    printed.forEach((s, i) => {
+      if (i > 0) out += s.startsWith("(") ? ";" : " ";
+      out += s;
+    });
+    return out;
+  }
+  /**
+   * Prints a nested block one level deeper, including the line breaks
+   * around it, so callers can write `do${body}end`.
+   */
+  printBody(block) {
+    this.depth++;
+    const inner = this.printBlock(block);
+    this.depth--;
+    if (this.compact) return inner ? ` ${inner} ` : " ";
+    return `
+${inner}
+${this.pad()}`;
+  }
+  printStatement(stmt) {
+    switch (stmt.type) {
+      case "CompoundAssignmentStatement":
+        this.requireLuau("compound assignment", stmt);
+        break;
+      case "ContinueStatement":
+        this.requireLuau("'continue'", stmt);
+        break;
+      case "TypeAliasStatement":
+      case "ExportTypeAliasStatement":
+        this.requireLuau("type alias", stmt);
+        break;
+    }
+    switch (stmt.type) {
+      case "LocalStatement":
+        return this.printLocalStatement(stmt);
+      case "LocalFunctionStatement":
+        return this.printLocalFunctionStatement(stmt);
+      case "FunctionDeclarationStatement":
+        return this.printFunctionDeclarationStatement(stmt);
+      case "AssignmentStatement":
+        return this.printAssignmentStatement(stmt);
+      case "CompoundAssignmentStatement":
+        return this.printCompoundAssignmentStatement(stmt);
+      case "CallStatement":
+        return this.printExpression(stmt.expression);
+      case "DoStatement":
+        return this.printDoStatement(stmt);
+      case "WhileStatement":
+        return this.printWhileStatement(stmt);
+      case "RepeatStatement":
+        return this.printRepeatStatement(stmt);
+      case "IfStatement":
+        return this.printIfStatement(stmt);
+      case "NumericForStatement":
+        return this.printNumericForStatement(stmt);
+      case "GenericForStatement":
+        return this.printGenericForStatement(stmt);
+      case "ReturnStatement":
+        return this.printReturnStatement(stmt);
+      case "BreakStatement":
+        return "break";
+      case "ContinueStatement":
+        return "continue";
+      case "TypeAliasStatement":
+        return this.printTypeAliasStatement(stmt);
+      case "ExportTypeAliasStatement":
+        return "export " + this.printTypeAliasStatement(stmt.alias);
+    }
+  }
+  printAttributes(attributes, node) {
+    if (!attributes || attributes.length === 0) return "";
+    this.requireLuau("function attribute", node);
+    const sep = this.compact ? " " : "\n" + this.pad();
+    return attributes.map((a) => `@${a}${sep}`).join("");
+  }
+  printLocalStatement(stmt) {
+    if (stmt.isConst) this.requireLuau("'const'", stmt);
+    const kw = stmt.isConst ? "const" : "local";
+    const names = stmt.names.map((n) => this.printTypedIdentifier(n)).join(", ");
+    if (stmt.init.length === 0) {
+      return `${kw} ${names}`;
+    }
+    const init = stmt.init.map((e) => this.printExpression(e)).join(", ");
+    return `${kw} ${names} = ${init}`;
+  }
+  printLocalFunctionStatement(stmt) {
+    if (stmt.isConst) this.requireLuau("'const'", stmt);
+    const kw = stmt.isConst ? "const function" : "local function";
+    return `${this.printAttributes(stmt.attributes, stmt)}${kw} ${stmt.name.name}${this.printFunctionBody(stmt.func)}`;
+  }
+  printFunctionDeclarationStatement(stmt) {
+    const func = stmt.isMethod && stmt.func.params[0]?.name === "self" ? { ...stmt.func, params: stmt.func.params.slice(1) } : stmt.func;
+    return `${this.printAttributes(stmt.attributes, stmt)}function ${this.printFunctionName(stmt.target)}${this.printFunctionBody(func)}`;
+  }
+  printFunctionName(name) {
+    let out = name.base.name;
+    for (const p of name.path) out += "." + p.name;
+    if (name.method) out += ":" + name.method.name;
+    return out;
+  }
+  printAssignmentStatement(stmt) {
+    const targets = stmt.targets.map((t) => this.printExpression(t)).join(", ");
+    const values = stmt.values.map((v) => this.printExpression(v)).join(", ");
+    return `${targets} = ${values}`;
+  }
+  printCompoundAssignmentStatement(stmt) {
+    return `${this.printExpression(stmt.target)} ${stmt.operator} ${this.printExpression(stmt.value)}`;
+  }
+  printDoStatement(stmt) {
+    return `do${this.printBody(stmt.body)}end`;
+  }
+  printWhileStatement(stmt) {
+    return `while ${this.printExpression(stmt.condition)} do${this.printBody(stmt.body)}end`;
+  }
+  printRepeatStatement(stmt) {
+    return `repeat${this.printBody(stmt.body)}until ${this.printExpression(stmt.condition)}`;
+  }
+  printIfStatement(stmt) {
+    let out = "";
+    stmt.clauses.forEach((clause, i) => {
+      const kw = i === 0 ? "if" : "elseif";
+      out += `${kw} ${this.printExpression(clause.condition)} then${this.printBody(clause.body)}`;
+    });
+    if (stmt.alternate) {
+      out += `else${this.printBody(stmt.alternate)}`;
+    }
+    out += "end";
+    return out;
+  }
+  printNumericForStatement(stmt) {
+    const step = stmt.step ? `, ${this.printExpression(stmt.step)}` : "";
+    return `for ${this.printTypedIdentifier(stmt.variable)} = ${this.printExpression(stmt.start)}, ${this.printExpression(stmt.end)}${step} do${this.printBody(stmt.body)}end`;
+  }
+  printGenericForStatement(stmt) {
+    const names = stmt.variables.map((v) => this.printTypedIdentifier(v)).join(", ");
+    const iterators = stmt.iterators.map((e) => this.printExpression(e)).join(", ");
+    return `for ${names} in ${iterators} do${this.printBody(stmt.body)}end`;
+  }
+  printReturnStatement(stmt) {
+    if (stmt.arguments.length === 0) return "return";
+    return `return ${stmt.arguments.map((e) => this.printExpression(e)).join(", ")}`;
+  }
+  printTypeAliasStatement(stmt) {
+    const generics = this.printGenericTypeParameterList(stmt.generics);
+    return `type ${stmt.name.name}${generics} = ${this.printType(stmt.definition)}`;
+  }
+  printGenericTypeParameterList(generics) {
+    if (!generics || generics.length === 0) return "";
+    this.requireLuau("generic type parameters", generics[0]);
+    return `<${generics.map((g) => this.printGenericTypeParameter(g)).join(", ")}>`;
+  }
+  printGenericTypeParameter(g) {
+    let out = g.name + (g.isPack ? "..." : "");
+    if (g.default) {
+      out += " = " + (isTypePackNode(g.default) ? this.printTypePack(g.default) : this.printType(g.default));
+    }
+    return out;
+  }
+  // --------------------------------------------------------
+  // Shared helpers
+  // --------------------------------------------------------
+  printTypedIdentifier(id) {
+    if (id.attributes && id.attributes.length > 0) this.requireLuau("local attribute", id);
+    const attrs = id.attributes && id.attributes.length > 0 ? id.attributes.map((a) => `<${a}>`).join(" ") + " " : "";
+    const type = id.typeAnnotation ? `: ${this.printType(id.typeAnnotation)}` : "";
+    return `${attrs}${id.name}${type}`;
+  }
+  printFunctionParameter(p) {
+    const type = p.typeAnnotation ? `: ${this.printType(p.typeAnnotation)}` : "";
+    return `${p.name}${type}`;
+  }
+  printFunctionBody(func) {
+    const generics = this.printGenericTypeParameterList(func.generics);
+    const params = func.params.map((p) => this.printFunctionParameter(p));
+    if (func.hasVarargs) {
+      const type = func.varargTypeAnnotation ? `: ${this.printType(func.varargTypeAnnotation)}` : "";
+      params.push(`...${type}`);
+    }
+    const returnType = func.returnType ? `: ${this.printType(func.returnType)}` : "";
+    return `${generics}(${params.join(", ")})${returnType}${this.printBody(func.body)}end`;
+  }
+  // --------------------------------------------------------
+  // Expressions
+  // --------------------------------------------------------
+  printExpression(expr) {
+    switch (expr.type) {
+      case "InterpolatedStringExpression":
+        this.requireLuau("interpolated string", expr);
+        break;
+      case "TypeAssertionExpression":
+        this.requireLuau("type assertion", expr);
+        break;
+      case "IfElseExpression":
+        this.requireLuau("if-expression", expr);
+        break;
+    }
+    switch (expr.type) {
+      case "Identifier":
+        return expr.name;
+      case "NilLiteral":
+        return "nil";
+      case "BooleanLiteral":
+        return expr.value ? "true" : "false";
+      case "NumberLiteral":
+        return this.printNumberLiteral(expr);
+      case "StringLiteral":
+        return this.printStringLiteral(expr);
+      case "InterpolatedStringExpression":
+        return this.printInterpolatedString(expr);
+      case "VarargExpression":
+        return "...";
+      case "FunctionExpression":
+        return `function${this.printFunctionBody(expr.func)}`;
+      case "TableExpression":
+        return this.printTableExpression(expr);
+      case "BinaryExpression":
+        return this.printBinaryExpression(expr);
+      case "UnaryExpression":
+        return this.printUnaryExpression(expr);
+      case "MemberExpression":
+        return `${this.printOperand(expr.object, expr)}.${expr.property.name}`;
+      case "IndexExpression":
+        return `${this.printOperand(expr.object, expr)}[${this.printExpression(expr.index)}]`;
+      case "CallExpression":
+        return this.printCallExpression(expr);
+      case "MethodCallExpression":
+        return this.printMethodCallExpression(expr);
+      case "ParenthesizedExpression":
+        return `(${this.printExpression(expr.expression)})`;
+      case "TypeAssertionExpression":
+        return `${this.printOperand(expr.expression, expr)} :: ${this.printType(expr.typeAnnotation)}`;
+      case "IfElseExpression":
+        return this.printIfElseExpression(expr);
+    }
+  }
+  printNumberLiteral(lit) {
+    if (lit.raw === void 0 || lit.raw === "") return String(lit.value);
+    if (this.syntax === "lua51" && isLuauOnlyNumber(lit.raw)) return formatNumber(lit.value);
+    return lit.raw;
+  }
+  printStringLiteral(lit) {
+    return this.quoteString(lit.value);
+  }
+  quoteString(value) {
+    const q = this.quote;
+    let out = q;
+    const chars = [...value];
+    for (let i = 0; i < chars.length; i++) {
+      const ch = chars[i];
+      switch (ch) {
+        case "\\":
+          out += "\\\\";
+          break;
+        case "\n":
+          out += "\\n";
+          break;
+        case "\r":
+          out += "\\r";
+          break;
+        case "	":
+          out += "\\t";
+          break;
+        // A digit right after `\0` would be read as part of the decimal escape.
+        case "\0":
+          out += isDigitChar(chars[i + 1]) ? "\\000" : "\\0";
+          break;
+        case q:
+          out += "\\" + q;
+          break;
+        default:
+          out += ch;
+      }
+    }
+    return out + q;
+  }
+  printInterpolatedString(expr) {
+    let out = "`";
+    for (const part of expr.parts) {
+      if (part.kind === "string") {
+        out += this.escapeInterpolatedText(part.value);
+      } else {
+        out += "{" + this.printExpression(part.expression) + "}";
+      }
+    }
+    return out + "`";
+  }
+  escapeInterpolatedText(value) {
+    let out = "";
+    for (const ch of value) {
+      switch (ch) {
+        case "\\":
+          out += "\\\\";
+          break;
+        case "`":
+          out += "\\`";
+          break;
+        case "{":
+          out += "\\{";
+          break;
+        case "\n":
+          out += "\\n";
+          break;
+        case "\r":
+          out += "\\r";
+          break;
+        default:
+          out += ch;
+      }
+    }
+    return out;
+  }
+  printTableExpression(expr) {
+    if (expr.fields.length === 0) return "{}";
+    if (this.compact) return `{${expr.fields.map((f) => this.printTableField(f)).join(", ")}}`;
+    this.depth++;
+    const pad = this.pad();
+    const inner = expr.fields.map((f) => pad + this.printTableField(f)).join(",\n");
+    this.depth--;
+    return `{
+${inner}
+${this.pad()}}`;
+  }
+  printTableField(field) {
+    switch (field.type) {
+      case "TableFieldPositional":
+        return this.printExpression(field.value);
+      case "TableFieldNamed":
+        return `${field.name.name} = ${this.printExpression(field.value)}`;
+      case "TableFieldComputed":
+        return `[${this.printExpression(field.key)}] = ${this.printExpression(field.value)}`;
+    }
+  }
+  printBinaryExpression(expr) {
+    if (expr.operator === "//") this.requireLuau("floor division '//'", expr);
+    const left = this.printChildForBinary(expr.left, expr, "left");
+    const right = this.printChildForBinary(expr.right, expr, "right");
+    return `${left} ${expr.operator} ${right}`;
+  }
+  printChildForBinary(child, parent, side) {
+    const printed = this.printExpression(child);
+    if (child.type !== "BinaryExpression") {
+      return this.wrapIfNeeded(child, printed, parent);
+    }
+    const parentPrec = BINARY_PRECEDENCE[parent.operator];
+    const childPrec = BINARY_PRECEDENCE[child.operator];
+    let needsParens = false;
+    if (childPrec < parentPrec) {
+      needsParens = true;
+    } else if (childPrec === parentPrec) {
+      if (isRightAssociative(parent.operator)) {
+        needsParens = side === "left";
+      } else {
+        needsParens = side === "right";
+      }
+    }
+    return needsParens ? `(${printed})` : printed;
+  }
+  printUnaryExpression(expr) {
+    const argPrinted = this.printExpression(expr.argument);
+    let needsParens = false;
+    if (expr.argument.type === "BinaryExpression") {
+      needsParens = BINARY_PRECEDENCE[expr.argument.operator] < UNARY_PRECEDENCE;
+    } else if (expr.argument.type === "UnaryExpression") {
+      needsParens = false;
+    } else {
+      needsParens = !isSimpleOperand(expr.argument);
+    }
+    const arg = needsParens ? `(${argPrinted})` : argPrinted;
+    const needsSpace = expr.operator === "not" || arg.startsWith(expr.operator);
+    return `${expr.operator}${needsSpace ? " " : ""}${arg}`;
+  }
+  /** Generic operand wrapper for non-binary children used inside a binary expression. */
+  wrapIfNeeded(child, printed, _parent) {
+    if (child.type === "UnaryExpression" || isSimpleOperand(child)) return printed;
+    return printed;
+  }
+  /** True for expression kinds that never need parens as a generic sub-expression. */
+  isAtom(expr) {
+    return isSimpleOperand(expr);
+  }
+  /** Wraps `object`/`callee` in parens when required by call/member/index syntax. */
+  printOperand(object, _parent) {
+    const printed = this.printExpression(object);
+    if (isCallBaseSafe(object)) return printed;
+    return `(${printed})`;
+  }
+  printCallExpression(expr) {
+    const callee = this.printOperand(expr.callee, expr);
+    const args = expr.arguments.map((a) => this.printExpression(a)).join(", ");
+    return `${callee}(${args})`;
+  }
+  printMethodCallExpression(expr) {
+    const object = this.printOperand(expr.object, expr);
+    const args = expr.arguments.map((a) => this.printExpression(a)).join(", ");
+    return `${object}:${expr.method.name}(${args})`;
+  }
+  printIfElseExpression(expr) {
+    let out = "";
+    expr.clauses.forEach((clause, i) => {
+      const kw = i === 0 ? "if" : "elseif";
+      out += `${i === 0 ? "" : " "}${kw} ${this.printExpression(clause.condition)} then ${this.printExpression(clause.body)}`;
+    });
+    out += ` else ${this.printExpression(expr.alternate)}`;
+    return out;
+  }
+  // --------------------------------------------------------
+  // Types
+  // --------------------------------------------------------
+  printType(t) {
+    this.requireLuau("type annotation", t);
+    switch (t.type) {
+      case "TypeReference":
+        return this.printTypeReference(t);
+      case "TypeLiteralString":
+        return this.quoteString(t.value);
+      case "TypeLiteralBoolean":
+        return t.value ? "true" : "false";
+      case "TableTypeNode":
+        return this.printTableType(t);
+      case "FunctionTypeNode":
+        return this.printFunctionType(t);
+      case "UnionTypeNode":
+        return this.printUnionType(t);
+      case "IntersectionTypeNode":
+        return this.printIntersectionType(t);
+      case "OptionalTypeNode":
+        return `${this.printTypeOperand(t.typeAnnotation)}?`;
+      case "ParenthesizedTypeNode":
+        return `(${this.printType(t.typeAnnotation)})`;
+      case "TypeofTypeNode":
+        return `typeof(${this.printExpression(t.expression)})`;
+      case "VariadicTypeNode":
+        return `...${this.printType(t.typeAnnotation)}`;
+      case "TypePackNode":
+        return this.printTypePack(t);
+    }
+  }
+  printTypeOperand(t) {
+    if (t.type === "UnionTypeNode" || t.type === "IntersectionTypeNode" || t.type === "FunctionTypeNode") {
+      return `(${this.printType(t)})`;
+    }
+    return this.printType(t);
+  }
+  printTypeReference(t) {
+    const ns = t.namespace ? `${t.namespace}.` : "";
+    const args = t.typeArguments.length > 0 ? `<${t.typeArguments.map((a) => this.printType(a)).join(", ")}>` : "";
+    return `${ns}${t.base}${args}`;
+  }
+  printTableType(t) {
+    if (t.properties.length === 0) return "{}";
+    const inner = t.properties.map((p) => this.printTableTypeProperty(p)).join(", ");
+    return `{ ${inner} }`;
+  }
+  printTableTypeProperty(p) {
+    if (p.type === "TableTypeIndexer") {
+      return `[${this.printType(p.keyType)}]: ${this.printType(p.valueType)}`;
+    }
+    return `${p.name}: ${this.printType(p.valueType)}`;
+  }
+  /**
+   * Prints a vararg type suffix for function-type / type-pack parameter
+   * lists. Two distinct grammar productions share this position:
+   *   - `...T`  — a vararg of type T (the dots come first in the source).
+   *     Represented as a bare `TypeNode` (no wrapper).
+   *   - `A...`  — a reference to a generic type pack `A` (the name comes
+   *     first). Represented as a `VariadicTypeNode` wrapping the
+   *     reference, so the printer must append `...` rather than prepend
+   *     it — prepending would reorder `A...` into the invalid `...A`.
+   */
+  printVarargTypeSuffix(varargType) {
+    if (!varargType) return "...";
+    if (varargType.type === "VariadicTypeNode") return `${this.printType(varargType.typeAnnotation)}...`;
+    return `...${this.printType(varargType)}`;
+  }
+  printFunctionType(t) {
+    const generics = this.printGenericTypeParameterList(t.generics);
+    const params = t.params.map((p) => this.printFunctionTypeParameter(p));
+    if (t.hasVarargs) {
+      params.push(this.printVarargTypeSuffix(t.varargType));
+    }
+    return `${generics}(${params.join(", ")}) -> ${this.printType(t.returnType)}`;
+  }
+  printFunctionTypeParameter(p) {
+    const name = p.name ? `${p.name}: ` : "";
+    return `${name}${this.printType(p.typeAnnotation)}`;
+  }
+  printUnionType(t) {
+    return t.types.map((m) => this.printUnionMember(m)).join(" | ");
+  }
+  printIntersectionType(t) {
+    return t.types.map((m) => this.printIntersectionMember(m)).join(" & ");
+  }
+  printUnionMember(t) {
+    if (t.type === "IntersectionTypeNode" || t.type === "FunctionTypeNode") return `(${this.printType(t)})`;
+    return this.printType(t);
+  }
+  printIntersectionMember(t) {
+    if (t.type === "UnionTypeNode" || t.type === "FunctionTypeNode") return `(${this.printType(t)})`;
+    return this.printType(t);
+  }
+  printTypePack(t) {
+    const parts = t.types.map((ty) => this.printType(ty));
+    if (t.hasVarargs) parts.push(this.printVarargTypeSuffix(t.varargType));
+    if (t.types.length === 0 && t.hasVarargs) return parts[0];
+    return `(${parts.join(", ")})`;
+  }
+};
+function isCallBaseSafe(expr) {
+  switch (expr.type) {
+    case "Identifier":
+    case "MemberExpression":
+    case "IndexExpression":
+    case "CallExpression":
+    case "MethodCallExpression":
+    case "ParenthesizedExpression":
+      return true;
+    default:
+      return false;
+  }
+}
+function isSimpleOperand(expr) {
+  switch (expr.type) {
+    case "Identifier":
+    case "NilLiteral":
+    case "BooleanLiteral":
+    case "NumberLiteral":
+    case "StringLiteral":
+    case "InterpolatedStringExpression":
+    case "VarargExpression":
+    case "FunctionExpression":
+    case "TableExpression":
+    case "MemberExpression":
+    case "IndexExpression":
+    case "CallExpression":
+    case "MethodCallExpression":
+    case "ParenthesizedExpression":
+    case "TypeAssertionExpression":
+    case "IfElseExpression":
+      return true;
+    default:
+      return false;
+  }
+}
+function isDigitChar(ch) {
+  return ch !== void 0 && ch >= "0" && ch <= "9";
+}
+function isLuauOnlyNumber(raw) {
+  return /^0[bB]/.test(raw) || raw.includes("_");
+}
+function formatNumber(value) {
+  if (value === Infinity) return "1e999";
+  return String(value);
+}
+function isTypePackNode(t) {
+  return t.type === "TypePackNode";
+}
+var STATEMENT_TYPES = /* @__PURE__ */ new Set([
+  "LocalStatement",
+  "LocalFunctionStatement",
+  "FunctionDeclarationStatement",
+  "AssignmentStatement",
+  "CompoundAssignmentStatement",
+  "CallStatement",
+  "DoStatement",
+  "WhileStatement",
+  "RepeatStatement",
+  "IfStatement",
+  "NumericForStatement",
+  "GenericForStatement",
+  "ReturnStatement",
+  "BreakStatement",
+  "ContinueStatement",
+  "TypeAliasStatement",
+  "ExportTypeAliasStatement"
+]);
+function isStatementType(type) {
+  return STATEMENT_TYPES.has(type);
+}
+var TYPE_NODE_TYPES = /* @__PURE__ */ new Set([
+  "TypeReference",
+  "TypeLiteralString",
+  "TypeLiteralBoolean",
+  "TableTypeNode",
+  "FunctionTypeNode",
+  "UnionTypeNode",
+  "IntersectionTypeNode",
+  "OptionalTypeNode",
+  "ParenthesizedTypeNode",
+  "TypeofTypeNode",
+  "VariadicTypeNode",
+  "TypePackNode"
+]);
+function isTypeNodeType(type) {
+  return TYPE_NODE_TYPES.has(type);
+}
+
 // src/ast/builders.ts
 var ParseError = class extends Error {
   constructor(message, line, column) {
@@ -574,7 +1264,7 @@ function spanFrom(start, end) {
     column: { start: start.column.start, end: end.column.end }
   };
 }
-var BINARY_PRECEDENCE = {
+var BINARY_PRECEDENCE2 = {
   "or": 1,
   "and": 2,
   "<": 3,
@@ -593,13 +1283,20 @@ var BINARY_PRECEDENCE = {
   "^": 8
 };
 var RIGHT_ASSOCIATIVE = /* @__PURE__ */ new Set(["..", "^"]);
-var UNARY_PRECEDENCE = 7;
+var UNARY_PRECEDENCE2 = 7;
 var COMPOUND_ASSIGN_OPS = /* @__PURE__ */ new Set(["+=", "-=", "*=", "/=", "//=", "%=", "^=", "..="]);
 var Parser = class {
   tokens;
   cursor = 0;
-  constructor(tokens) {
+  syntax;
+  constructor(tokens, options) {
     this.tokens = tokens;
+    this.syntax = options?.syntax ?? "luau";
+  }
+  /** Throws when parsing as Lua 5.1 and `feature` only exists in Luau. */
+  requireLuau(feature, at = this.current()) {
+    if (this.syntax !== "lua51") return;
+    throw new ParseError(`${feature} is not supported in Lua 5.1`, at.line.start, at.column.start);
   }
   current() {
     return this.tokens[this.cursor];
@@ -727,6 +1424,7 @@ var Parser = class {
   parseStatement() {
     const t = this.current();
     if (t.type === "Punctuator" && t.value === "@") {
+      this.requireLuau("function attribute", t);
       const { attributes, start } = this.parseAttributes();
       const next = this.current();
       if (next.type === "Keyword" && next.value === "local") {
@@ -779,6 +1477,7 @@ var Parser = class {
           return { type: "BreakStatement", ...spanFrom(t, this.previous()) };
         }
         case "continue": {
+          this.requireLuau("'continue'", t);
           this.advance();
           return { type: "ContinueStatement", ...spanFrom(t, this.previous()) };
         }
@@ -827,6 +1526,7 @@ var Parser = class {
   }
   parseConstStatement() {
     const start = this.current();
+    this.requireLuau("'const'", start);
     this.advance();
     if (this.matchKeyword("function")) {
       const name = this.parseIdentifier();
@@ -848,6 +1548,7 @@ var Parser = class {
     let typeAnnotation;
     let attributes;
     if (this.checkOperator("<")) {
+      this.requireLuau("local attribute");
       this.advance();
       attributes = [];
       attributes.push(this.expectIdentifier().value);
@@ -857,6 +1558,7 @@ var Parser = class {
       this.expectOperator(">");
     }
     if (this.matchPunctuator(":")) {
+      this.requireLuau("type annotation", this.previous());
       typeAnnotation = this.parseType();
     }
     return {
@@ -871,6 +1573,7 @@ var Parser = class {
     const nameTok = this.expectIdentifier();
     let typeAnnotation;
     if (this.matchPunctuator(":")) {
+      this.requireLuau("type annotation", this.previous());
       typeAnnotation = this.parseType();
     }
     return {
@@ -1023,6 +1726,7 @@ var Parser = class {
   }
   parseTypeAliasStatement() {
     const start = this.current();
+    this.requireLuau("type alias", start);
     this.advance();
     const nameTok = this.expectIdentifier();
     const name = { type: "Identifier", name: nameTok.value, ...spanFrom(nameTok, nameTok) };
@@ -1036,6 +1740,7 @@ var Parser = class {
   }
   parseExportTypeAliasStatement() {
     const start = this.current();
+    this.requireLuau("type alias", start);
     this.advance();
     const alias = this.parseTypeAliasStatement();
     return { type: "ExportTypeAliasStatement", alias, ...spanFrom(start, this.previous()) };
@@ -1054,6 +1759,7 @@ var Parser = class {
     }
     const t = this.current();
     if (t.type === "Operator" && COMPOUND_ASSIGN_OPS.has(t.value)) {
+      this.requireLuau("compound assignment", t);
       const op = this.advance().value;
       const value = this.parseExpression();
       return {
@@ -1084,7 +1790,7 @@ var Parser = class {
     if (t.type === "Keyword" && (t.value === "and" || t.value === "or")) {
       return t.value;
     }
-    if (t.type === "Operator" && t.value in BINARY_PRECEDENCE) {
+    if (t.type === "Operator" && t.value in BINARY_PRECEDENCE2) {
       return t.value;
     }
     return null;
@@ -1100,8 +1806,9 @@ var Parser = class {
     while (true) {
       const op = this.isBinaryOperator();
       if (!op) break;
-      const prec = BINARY_PRECEDENCE[op];
+      const prec = BINARY_PRECEDENCE2[op];
       if (prec < minPrec) break;
+      if (op === "//") this.requireLuau("floor division '//'");
       this.advance();
       const rightAssoc = RIGHT_ASSOCIATIVE.has(op);
       const nextMinPrec = rightAssoc ? prec : prec + 1;
@@ -1120,7 +1827,7 @@ var Parser = class {
     const op = this.isUnaryOperator();
     if (op) {
       const opTok = this.advance();
-      const argument = this.parseExpression(UNARY_PRECEDENCE);
+      const argument = this.parseExpression(UNARY_PRECEDENCE2);
       return {
         type: "UnaryExpression",
         operator: op,
@@ -1133,6 +1840,7 @@ var Parser = class {
   parseAtomWithAssertion() {
     let expr = this.parseAtom();
     while (this.checkPunctuator("::")) {
+      this.requireLuau("type assertion");
       this.advance();
       const typeAnnotation = this.parseType();
       expr = {
@@ -1155,8 +1863,10 @@ var Parser = class {
         case "boolean":
           return { type: "BooleanLiteral", value: lit.value, ...spanFrom(t, t) };
         case "number":
+          if (isLuauOnlyNumber(lit.raw)) this.requireLuau(`number literal '${lit.raw}'`, t);
           return { type: "NumberLiteral", value: lit.value, raw: lit.raw, ...spanFrom(t, t) };
         case "string":
+          this.checkStringEscapes(t);
           return { type: "StringLiteral", value: lit.value, raw: lit.raw, ...spanFrom(t, t) };
       }
     }
@@ -1184,7 +1894,21 @@ var Parser = class {
     }
     this.error("Unexpected token in expression");
   }
+  /** Rejects the `\x`, `\z` and `\u` escapes Lua 5.1 doesn't have. */
+  checkStringEscapes(t) {
+    if (this.syntax !== "lua51") return;
+    const raw = t.raw;
+    if (raw.startsWith("[")) return;
+    for (let i = 0; i < raw.length; i++) {
+      if (raw[i] !== "\\") continue;
+      const next = raw[++i];
+      if (next === "x" || next === "z" || next === "u") {
+        this.requireLuau(`string escape '\\${next}'`, t);
+      }
+    }
+  }
   buildInterpolatedString(token) {
+    this.requireLuau("interpolated string", token);
     const parts = [];
     for (const p of token.parts) {
       if (p.kind === "string") {
@@ -1198,6 +1922,7 @@ var Parser = class {
   }
   parseIfElseExpression() {
     const start = this.current();
+    this.requireLuau("if-expression", start);
     this.expectKeyword("if");
     const clauses = [];
     const cond = this.parseExpression();
@@ -1277,6 +2002,7 @@ var Parser = class {
     }
     const t = this.current();
     if (t.type === "Literal" && t.kind === "string") {
+      this.checkStringEscapes(t);
       this.advance();
       return [{ type: "StringLiteral", value: t.value, raw: t.raw, ...spanFrom(t, t) }];
     }
@@ -1344,10 +2070,20 @@ var Parser = class {
     }
     return this.parseType();
   }
+  parseTypeArgument() {
+    if (this.checkOperator("...")) {
+      return this.parseTypePack();
+    }
+    if (this.checkType("Identifier") && this.peek(1).type === "Operator" && this.peek(1).value === "...") {
+      return this.parseTypeOrTypePackReference();
+    }
+    return this.parseType();
+  }
   parseFunctionBody() {
     const start = this.current();
     let generics = [];
     if (this.checkOperator("<")) {
+      this.requireLuau("generic type parameters");
       generics = this.parseGenericTypeParameterList();
     }
     this.expectPunctuator("(");
@@ -1360,6 +2096,7 @@ var Parser = class {
           this.advance();
           hasVarargs = true;
           if (this.matchPunctuator(":")) {
+            this.requireLuau("type annotation", this.previous());
             varargTypeAnnotation = this.parseTypeOrTypePackReference();
           }
           break;
@@ -1367,6 +2104,7 @@ var Parser = class {
         const nameTok = this.expectIdentifier();
         let typeAnnotation;
         if (this.matchPunctuator(":")) {
+          this.requireLuau("type annotation", this.previous());
           typeAnnotation = this.parseType();
         }
         params.push({
@@ -1382,6 +2120,7 @@ var Parser = class {
     this.expectPunctuator(")");
     let returnType;
     if (this.matchPunctuator(":")) {
+      this.requireLuau("type annotation", this.previous());
       returnType = this.parseTypeOrTypePackReference();
     }
     const body = this.parseBlock();
@@ -1487,9 +2226,9 @@ var Parser = class {
       if (this.checkOperator("<")) {
         this.advance();
         if (!this.checkOperator(">")) {
-          typeArguments.push(this.parseType());
+          typeArguments.push(this.parseTypeArgument());
           while (this.matchPunctuator(",")) {
-            typeArguments.push(this.parseType());
+            typeArguments.push(this.parseTypeArgument());
           }
         }
         this.expectOperator(">");
@@ -1660,13 +2399,13 @@ var Parser = class {
     return list;
   }
 };
-function parse(source) {
+function parse(source, options) {
   const tokens = tokenize(source);
-  const parser = new Parser(tokens);
+  const parser = new Parser(tokens, options);
   return parser.parseProgram();
 }
-function parseTokens(tokens) {
-  const parser = new Parser(tokens);
+function parseTokens(tokens, options) {
+  const parser = new Parser(tokens, options);
   return parser.parseProgram();
 }
 function parseExpressionFromSource(raw) {
@@ -1674,613 +2413,6 @@ function parseExpressionFromSource(raw) {
   const parser = new Parser(tokens);
   const expr = parser.parseExpression();
   return expr;
-}
-
-// src/ast/printer.ts
-var DEFAULT_OPTIONS = {
-  quote: '"'
-};
-function print(node, options) {
-  const opts = { ...DEFAULT_OPTIONS, ...options };
-  const printer = new Printer(opts);
-  return printer.printNode(node);
-}
-var BINARY_PRECEDENCE2 = {
-  or: 1,
-  and: 2,
-  "<": 3,
-  ">": 3,
-  "<=": 3,
-  ">=": 3,
-  "~=": 3,
-  "==": 3,
-  "..": 4,
-  "+": 5,
-  "-": 5,
-  "*": 6,
-  "/": 6,
-  "//": 6,
-  "%": 6,
-  "^": 8
-};
-var UNARY_PRECEDENCE2 = 7;
-function isRightAssociative(op) {
-  return op === ".." || op === "^";
-}
-var Printer = class {
-  quote;
-  constructor(opts) {
-    this.quote = opts.quote;
-  }
-  printNode(node) {
-    switch (node.type) {
-      case "Program":
-        return this.printBlock(node.body);
-      case "Block":
-        return this.printBlock(node);
-      default:
-        if (isStatementType(node.type)) {
-          return this.printStatement(node);
-        }
-        if (isTypeNodeType(node.type)) {
-          return this.printType(node);
-        }
-        return this.printExpression(node);
-    }
-  }
-  // --------------------------------------------------------
-  // Block / Statements
-  // --------------------------------------------------------
-  /**
-   * Prints the statements of a block, one per line, each terminated with
-   * `;`. No indentation is applied — this printer favors bundler-style
-   * compact output over pretty-printing.
-   */
-  printBlock(block) {
-    return block.statements.map((s) => this.printStatement(s) + ";").join("\n");
-  }
-  printStatement(stmt) {
-    switch (stmt.type) {
-      case "LocalStatement":
-        return this.printLocalStatement(stmt);
-      case "LocalFunctionStatement":
-        return this.printLocalFunctionStatement(stmt);
-      case "FunctionDeclarationStatement":
-        return this.printFunctionDeclarationStatement(stmt);
-      case "AssignmentStatement":
-        return this.printAssignmentStatement(stmt);
-      case "CompoundAssignmentStatement":
-        return this.printCompoundAssignmentStatement(stmt);
-      case "CallStatement":
-        return this.printExpression(stmt.expression);
-      case "DoStatement":
-        return this.printDoStatement(stmt);
-      case "WhileStatement":
-        return this.printWhileStatement(stmt);
-      case "RepeatStatement":
-        return this.printRepeatStatement(stmt);
-      case "IfStatement":
-        return this.printIfStatement(stmt);
-      case "NumericForStatement":
-        return this.printNumericForStatement(stmt);
-      case "GenericForStatement":
-        return this.printGenericForStatement(stmt);
-      case "ReturnStatement":
-        return this.printReturnStatement(stmt);
-      case "BreakStatement":
-        return "break";
-      case "ContinueStatement":
-        return "continue";
-      case "TypeAliasStatement":
-        return this.printTypeAliasStatement(stmt);
-      case "ExportTypeAliasStatement":
-        return "export " + this.printTypeAliasStatement(stmt.alias);
-    }
-  }
-  printAttributes(attributes) {
-    if (!attributes || attributes.length === 0) return "";
-    return attributes.map((a) => `@${a}
-`).join("");
-  }
-  printLocalStatement(stmt) {
-    const kw = stmt.isConst ? "const" : "local";
-    const names = stmt.names.map((n) => this.printTypedIdentifier(n)).join(", ");
-    if (stmt.init.length === 0) {
-      return `${kw} ${names}`;
-    }
-    const init = stmt.init.map((e) => this.printExpression(e)).join(", ");
-    return `${kw} ${names} = ${init}`;
-  }
-  printLocalFunctionStatement(stmt) {
-    const kw = stmt.isConst ? "const function" : "local function";
-    return `${this.printAttributes(stmt.attributes)}${kw} ${stmt.name.name}${this.printFunctionBody(stmt.func)}`;
-  }
-  printFunctionDeclarationStatement(stmt) {
-    const func = stmt.isMethod && stmt.func.params[0]?.name === "self" ? { ...stmt.func, params: stmt.func.params.slice(1) } : stmt.func;
-    return `${this.printAttributes(stmt.attributes)}function ${this.printFunctionName(stmt.target)}${this.printFunctionBody(func)}`;
-  }
-  printFunctionName(name) {
-    let out = name.base.name;
-    for (const p of name.path) out += "." + p.name;
-    if (name.method) out += ":" + name.method.name;
-    return out;
-  }
-  printAssignmentStatement(stmt) {
-    const targets = stmt.targets.map((t) => this.printExpression(t)).join(", ");
-    const values = stmt.values.map((v) => this.printExpression(v)).join(", ");
-    return `${targets} = ${values}`;
-  }
-  printCompoundAssignmentStatement(stmt) {
-    return `${this.printExpression(stmt.target)} ${stmt.operator} ${this.printExpression(stmt.value)}`;
-  }
-  printDoStatement(stmt) {
-    return `do
-${this.printBlock(stmt.body)}
-end`;
-  }
-  printWhileStatement(stmt) {
-    return `while ${this.printExpression(stmt.condition)} do
-${this.printBlock(stmt.body)}
-end`;
-  }
-  printRepeatStatement(stmt) {
-    return `repeat
-${this.printBlock(stmt.body)}
-until ${this.printExpression(stmt.condition)}`;
-  }
-  printIfStatement(stmt) {
-    let out = "";
-    stmt.clauses.forEach((clause, i) => {
-      const kw = i === 0 ? "if" : "elseif";
-      out += `${kw} ${this.printExpression(clause.condition)} then
-${this.printBlock(clause.body)}
-`;
-    });
-    if (stmt.alternate) {
-      out += `else
-${this.printBlock(stmt.alternate)}
-`;
-    }
-    out += "end";
-    return out;
-  }
-  printNumericForStatement(stmt) {
-    const step = stmt.step ? `, ${this.printExpression(stmt.step)}` : "";
-    return `for ${this.printTypedIdentifier(stmt.variable)} = ${this.printExpression(stmt.start)}, ${this.printExpression(stmt.end)}${step} do
-${this.printBlock(stmt.body)}
-end`;
-  }
-  printGenericForStatement(stmt) {
-    const names = stmt.variables.map((v) => this.printTypedIdentifier(v)).join(", ");
-    const iterators = stmt.iterators.map((e) => this.printExpression(e)).join(", ");
-    return `for ${names} in ${iterators} do
-${this.printBlock(stmt.body)}
-end`;
-  }
-  printReturnStatement(stmt) {
-    if (stmt.arguments.length === 0) return "return";
-    return `return ${stmt.arguments.map((e) => this.printExpression(e)).join(", ")}`;
-  }
-  printTypeAliasStatement(stmt) {
-    const generics = this.printGenericTypeParameterList(stmt.generics);
-    return `type ${stmt.name.name}${generics} = ${this.printType(stmt.definition)}`;
-  }
-  printGenericTypeParameterList(generics) {
-    if (!generics || generics.length === 0) return "";
-    return `<${generics.map((g) => this.printGenericTypeParameter(g)).join(", ")}>`;
-  }
-  printGenericTypeParameter(g) {
-    let out = g.name + (g.isPack ? "..." : "");
-    if (g.default) {
-      out += " = " + (isTypePackNode(g.default) ? this.printTypePack(g.default) : this.printType(g.default));
-    }
-    return out;
-  }
-  // --------------------------------------------------------
-  // Shared helpers
-  // --------------------------------------------------------
-  printTypedIdentifier(id) {
-    const attrs = id.attributes && id.attributes.length > 0 ? id.attributes.map((a) => `<${a}>`).join(" ") + " " : "";
-    const type = id.typeAnnotation ? `: ${this.printType(id.typeAnnotation)}` : "";
-    return `${attrs}${id.name}${type}`;
-  }
-  printFunctionParameter(p) {
-    const type = p.typeAnnotation ? `: ${this.printType(p.typeAnnotation)}` : "";
-    return `${p.name}${type}`;
-  }
-  printFunctionBody(func) {
-    const generics = this.printGenericTypeParameterList(func.generics);
-    const params = func.params.map((p) => this.printFunctionParameter(p));
-    if (func.hasVarargs) {
-      const type = func.varargTypeAnnotation ? `: ${this.printType(func.varargTypeAnnotation)}` : "";
-      params.push(`...${type}`);
-    }
-    const returnType = func.returnType ? `: ${this.printType(func.returnType)}` : "";
-    return `${generics}(${params.join(", ")})${returnType}
-${this.printBlock(func.body)}
-end`;
-  }
-  // --------------------------------------------------------
-  // Expressions
-  // --------------------------------------------------------
-  printExpression(expr) {
-    switch (expr.type) {
-      case "Identifier":
-        return expr.name;
-      case "NilLiteral":
-        return "nil";
-      case "BooleanLiteral":
-        return expr.value ? "true" : "false";
-      case "NumberLiteral":
-        return this.printNumberLiteral(expr);
-      case "StringLiteral":
-        return this.printStringLiteral(expr);
-      case "InterpolatedStringExpression":
-        return this.printInterpolatedString(expr);
-      case "VarargExpression":
-        return "...";
-      case "FunctionExpression":
-        return `function${this.printFunctionBody(expr.func)}`;
-      case "TableExpression":
-        return this.printTableExpression(expr);
-      case "BinaryExpression":
-        return this.printBinaryExpression(expr);
-      case "UnaryExpression":
-        return this.printUnaryExpression(expr);
-      case "MemberExpression":
-        return `${this.printOperand(expr.object, expr)}.${expr.property.name}`;
-      case "IndexExpression":
-        return `${this.printOperand(expr.object, expr)}[${this.printExpression(expr.index)}]`;
-      case "CallExpression":
-        return this.printCallExpression(expr);
-      case "MethodCallExpression":
-        return this.printMethodCallExpression(expr);
-      case "ParenthesizedExpression":
-        return `(${this.printExpression(expr.expression)})`;
-      case "TypeAssertionExpression":
-        return `${this.printOperand(expr.expression, expr)} :: ${this.printType(expr.typeAnnotation)}`;
-      case "IfElseExpression":
-        return this.printIfElseExpression(expr);
-    }
-  }
-  printNumberLiteral(lit) {
-    return lit.raw !== void 0 && lit.raw !== "" ? lit.raw : String(lit.value);
-  }
-  printStringLiteral(lit) {
-    return this.quoteString(lit.value);
-  }
-  quoteString(value) {
-    const q = this.quote;
-    let out = q;
-    for (const ch of value) {
-      switch (ch) {
-        case "\\":
-          out += "\\\\";
-          break;
-        case "\n":
-          out += "\\n";
-          break;
-        case "\r":
-          out += "\\r";
-          break;
-        case "	":
-          out += "\\t";
-          break;
-        case "\0":
-          out += "\\0";
-          break;
-        case q:
-          out += "\\" + q;
-          break;
-        default:
-          out += ch;
-      }
-    }
-    return out + q;
-  }
-  printInterpolatedString(expr) {
-    let out = "`";
-    for (const part of expr.parts) {
-      if (part.kind === "string") {
-        out += this.escapeInterpolatedText(part.value);
-      } else {
-        out += "{" + this.printExpression(part.expression) + "}";
-      }
-    }
-    return out + "`";
-  }
-  escapeInterpolatedText(value) {
-    let out = "";
-    for (const ch of value) {
-      switch (ch) {
-        case "\\":
-          out += "\\\\";
-          break;
-        case "`":
-          out += "\\`";
-          break;
-        case "{":
-          out += "\\{";
-          break;
-        case "\n":
-          out += "\\n";
-          break;
-        case "\r":
-          out += "\\r";
-          break;
-        default:
-          out += ch;
-      }
-    }
-    return out;
-  }
-  printTableExpression(expr) {
-    if (expr.fields.length === 0) return "{}";
-    const inner = expr.fields.map((f) => this.printTableField(f)).join(",\n");
-    return `{
-${inner}
-}`;
-  }
-  printTableField(field) {
-    switch (field.type) {
-      case "TableFieldPositional":
-        return this.printExpression(field.value);
-      case "TableFieldNamed":
-        return `${field.name.name} = ${this.printExpression(field.value)}`;
-      case "TableFieldComputed":
-        return `[${this.printExpression(field.key)}] = ${this.printExpression(field.value)}`;
-    }
-  }
-  printBinaryExpression(expr) {
-    const left = this.printChildForBinary(expr.left, expr, "left");
-    const right = this.printChildForBinary(expr.right, expr, "right");
-    return `${left} ${expr.operator} ${right}`;
-  }
-  printChildForBinary(child, parent, side) {
-    const printed = this.printExpression(child);
-    if (child.type !== "BinaryExpression") {
-      return this.wrapIfNeeded(child, printed, parent);
-    }
-    const parentPrec = BINARY_PRECEDENCE2[parent.operator];
-    const childPrec = BINARY_PRECEDENCE2[child.operator];
-    let needsParens = false;
-    if (childPrec < parentPrec) {
-      needsParens = true;
-    } else if (childPrec === parentPrec) {
-      if (isRightAssociative(parent.operator)) {
-        needsParens = side === "left";
-      } else {
-        needsParens = side === "right";
-      }
-    }
-    return needsParens ? `(${printed})` : printed;
-  }
-  printUnaryExpression(expr) {
-    const argPrinted = this.printExpression(expr.argument);
-    let needsParens = false;
-    if (expr.argument.type === "BinaryExpression") {
-      needsParens = BINARY_PRECEDENCE2[expr.argument.operator] < UNARY_PRECEDENCE2;
-    } else if (expr.argument.type === "UnaryExpression") {
-      needsParens = false;
-    } else {
-      needsParens = !isSimpleOperand(expr.argument);
-    }
-    const arg = needsParens ? `(${argPrinted})` : argPrinted;
-    const needsSpace = expr.operator === "not" || arg.startsWith(expr.operator);
-    return `${expr.operator}${needsSpace ? " " : ""}${arg}`;
-  }
-  /** Generic operand wrapper for non-binary children used inside a binary expression. */
-  wrapIfNeeded(child, printed, _parent) {
-    if (child.type === "UnaryExpression" || isSimpleOperand(child)) return printed;
-    return printed;
-  }
-  /** True for expression kinds that never need parens as a generic sub-expression. */
-  isAtom(expr) {
-    return isSimpleOperand(expr);
-  }
-  /** Wraps `object`/`callee` in parens when required by call/member/index syntax. */
-  printOperand(object, _parent) {
-    const printed = this.printExpression(object);
-    if (isCallBaseSafe(object)) return printed;
-    return `(${printed})`;
-  }
-  printCallExpression(expr) {
-    const callee = this.printOperand(expr.callee, expr);
-    const args = expr.arguments.map((a) => this.printExpression(a)).join(", ");
-    return `${callee}(${args})`;
-  }
-  printMethodCallExpression(expr) {
-    const object = this.printOperand(expr.object, expr);
-    const args = expr.arguments.map((a) => this.printExpression(a)).join(", ");
-    return `${object}:${expr.method.name}(${args})`;
-  }
-  printIfElseExpression(expr) {
-    let out = "";
-    expr.clauses.forEach((clause, i) => {
-      const kw = i === 0 ? "if" : "elseif";
-      out += `${i === 0 ? "" : " "}${kw} ${this.printExpression(clause.condition)} then ${this.printExpression(clause.body)}`;
-    });
-    out += ` else ${this.printExpression(expr.alternate)}`;
-    return out;
-  }
-  // --------------------------------------------------------
-  // Types
-  // --------------------------------------------------------
-  printType(t) {
-    switch (t.type) {
-      case "TypeReference":
-        return this.printTypeReference(t);
-      case "TypeLiteralString":
-        return this.quoteString(t.value);
-      case "TypeLiteralBoolean":
-        return t.value ? "true" : "false";
-      case "TableTypeNode":
-        return this.printTableType(t);
-      case "FunctionTypeNode":
-        return this.printFunctionType(t);
-      case "UnionTypeNode":
-        return this.printUnionType(t);
-      case "IntersectionTypeNode":
-        return this.printIntersectionType(t);
-      case "OptionalTypeNode":
-        return `${this.printTypeOperand(t.typeAnnotation)}?`;
-      case "ParenthesizedTypeNode":
-        return `(${this.printType(t.typeAnnotation)})`;
-      case "TypeofTypeNode":
-        return `typeof(${this.printExpression(t.expression)})`;
-      case "VariadicTypeNode":
-        return `...${this.printType(t.typeAnnotation)}`;
-      case "TypePackNode":
-        return this.printTypePack(t);
-    }
-  }
-  printTypeOperand(t) {
-    if (t.type === "UnionTypeNode" || t.type === "IntersectionTypeNode" || t.type === "FunctionTypeNode") {
-      return `(${this.printType(t)})`;
-    }
-    return this.printType(t);
-  }
-  printTypeReference(t) {
-    const ns = t.namespace ? `${t.namespace}.` : "";
-    const args = t.typeArguments.length > 0 ? `<${t.typeArguments.map((a) => this.printType(a)).join(", ")}>` : "";
-    return `${ns}${t.base}${args}`;
-  }
-  printTableType(t) {
-    if (t.properties.length === 0) return "{}";
-    const inner = t.properties.map((p) => this.printTableTypeProperty(p)).join(", ");
-    return `{ ${inner} }`;
-  }
-  printTableTypeProperty(p) {
-    if (p.type === "TableTypeIndexer") {
-      return `[${this.printType(p.keyType)}]: ${this.printType(p.valueType)}`;
-    }
-    return `${p.name}: ${this.printType(p.valueType)}`;
-  }
-  /**
-   * Prints a vararg type suffix for function-type / type-pack parameter
-   * lists. Two distinct grammar productions share this position:
-   *   - `...T`  — a vararg of type T (the dots come first in the source).
-   *     Represented as a bare `TypeNode` (no wrapper).
-   *   - `A...`  — a reference to a generic type pack `A` (the name comes
-   *     first). Represented as a `VariadicTypeNode` wrapping the
-   *     reference, so the printer must append `...` rather than prepend
-   *     it — prepending would reorder `A...` into the invalid `...A`.
-   */
-  printVarargTypeSuffix(varargType) {
-    if (!varargType) return "...";
-    if (varargType.type === "VariadicTypeNode") return `${this.printType(varargType.typeAnnotation)}...`;
-    return `...${this.printType(varargType)}`;
-  }
-  printFunctionType(t) {
-    const generics = this.printGenericTypeParameterList(t.generics);
-    const params = t.params.map((p) => this.printFunctionTypeParameter(p));
-    if (t.hasVarargs) {
-      params.push(this.printVarargTypeSuffix(t.varargType));
-    }
-    return `${generics}(${params.join(", ")}) -> ${this.printType(t.returnType)}`;
-  }
-  printFunctionTypeParameter(p) {
-    const name = p.name ? `${p.name}: ` : "";
-    return `${name}${this.printType(p.typeAnnotation)}`;
-  }
-  printUnionType(t) {
-    return t.types.map((m) => this.printUnionMember(m)).join(" | ");
-  }
-  printIntersectionType(t) {
-    return t.types.map((m) => this.printIntersectionMember(m)).join(" & ");
-  }
-  printUnionMember(t) {
-    if (t.type === "IntersectionTypeNode" || t.type === "FunctionTypeNode") return `(${this.printType(t)})`;
-    return this.printType(t);
-  }
-  printIntersectionMember(t) {
-    if (t.type === "UnionTypeNode" || t.type === "FunctionTypeNode") return `(${this.printType(t)})`;
-    return this.printType(t);
-  }
-  printTypePack(t) {
-    const parts = t.types.map((ty) => this.printType(ty));
-    if (t.hasVarargs) parts.push(this.printVarargTypeSuffix(t.varargType));
-    if (t.types.length === 0 && t.hasVarargs) return parts[0];
-    return `(${parts.join(", ")})`;
-  }
-};
-function isCallBaseSafe(expr) {
-  switch (expr.type) {
-    case "Identifier":
-    case "MemberExpression":
-    case "IndexExpression":
-    case "CallExpression":
-    case "MethodCallExpression":
-    case "ParenthesizedExpression":
-      return true;
-    default:
-      return false;
-  }
-}
-function isSimpleOperand(expr) {
-  switch (expr.type) {
-    case "Identifier":
-    case "NilLiteral":
-    case "BooleanLiteral":
-    case "NumberLiteral":
-    case "StringLiteral":
-    case "InterpolatedStringExpression":
-    case "VarargExpression":
-    case "FunctionExpression":
-    case "TableExpression":
-    case "MemberExpression":
-    case "IndexExpression":
-    case "CallExpression":
-    case "MethodCallExpression":
-    case "ParenthesizedExpression":
-    case "TypeAssertionExpression":
-    case "IfElseExpression":
-      return true;
-    default:
-      return false;
-  }
-}
-function isTypePackNode(t) {
-  return t.type === "TypePackNode";
-}
-var STATEMENT_TYPES = /* @__PURE__ */ new Set([
-  "LocalStatement",
-  "LocalFunctionStatement",
-  "FunctionDeclarationStatement",
-  "AssignmentStatement",
-  "CompoundAssignmentStatement",
-  "CallStatement",
-  "DoStatement",
-  "WhileStatement",
-  "RepeatStatement",
-  "IfStatement",
-  "NumericForStatement",
-  "GenericForStatement",
-  "ReturnStatement",
-  "BreakStatement",
-  "ContinueStatement",
-  "TypeAliasStatement",
-  "ExportTypeAliasStatement"
-]);
-function isStatementType(type) {
-  return STATEMENT_TYPES.has(type);
-}
-var TYPE_NODE_TYPES = /* @__PURE__ */ new Set([
-  "TypeReference",
-  "TypeLiteralString",
-  "TypeLiteralBoolean",
-  "TableTypeNode",
-  "FunctionTypeNode",
-  "UnionTypeNode",
-  "IntersectionTypeNode",
-  "OptionalTypeNode",
-  "ParenthesizedTypeNode",
-  "TypeofTypeNode",
-  "VariadicTypeNode",
-  "TypePackNode"
-]);
-function isTypeNodeType(type) {
-  return TYPE_NODE_TYPES.has(type);
 }
 
 // src/ast/nodes.ts
@@ -2588,6 +2720,7 @@ var index_default = luauparser;
   LexError,
   Operators,
   ParseError,
+  PrintError,
   Punctuators,
   UnaryOperators,
   analyzeScopes,
